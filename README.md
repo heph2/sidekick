@@ -8,7 +8,7 @@ It keeps the human in one conversation while coordinating the noisy parts:
 - implementation in an isolated Treehouse worktree
 - review by multiple harnesses
 - optional `no-mistakes` gating after implementation
-- one tmux workspace for visibility without constant pane switching
+- one tmux workspace with a live dashboard for visibility without constant pane switching
 
 ## Current shape
 
@@ -19,7 +19,8 @@ The default flow is:
 1. planner runs in the target repo and writes `.sidekick/runs/<id>/plan.md`
 2. implementer waits for the plan, then works in a leased Treehouse worktree
 3. reviewers wait for implementation to finish, then review the git diff
-4. optional gate window runs `no-mistakes -y`
+4. the dashboard window tracks goal, phase, artifacts, and recent output
+5. optional gate window runs `no-mistakes -y`
 
 ## Requirements
 
@@ -57,6 +58,20 @@ With the gate:
 ```sh
 bin/sidekick run --repo /path/to/project --task "Implement the requested feature and validate it" --gate --attach
 ```
+
+Render a run dashboard without attaching to tmux:
+
+```sh
+bin/sidekick status --run-dir /path/to/project/.sidekick/runs/<id>
+```
+
+Watch it live:
+
+```sh
+bin/sidekick status --run-dir /path/to/project/.sidekick/runs/<id> --watch
+```
+
+The dashboard includes the Sidekick wood-hero ASCII mascot, the current phase, pipeline status, run artifacts, and recent agent output.
 
 ## Config
 
@@ -121,3 +136,8 @@ treehouse return /path/to/leased/worktree
 ```
 
 The run state and logs live under `.sidekick/runs/<id>/`.
+
+## Agent Notes
+
+Project-local guidance for AI harnesses lives in `AGENTS.md`.
+`CLAUDE.md` is a symlink to the same file so Claude-style harnesses read identical instructions.
