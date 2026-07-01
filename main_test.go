@@ -187,6 +187,38 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestPresetAgent(t *testing.T) {
+	tests := []struct {
+		harness     string
+		role        string
+		command     []string
+		promptMode  string
+		interactive bool
+	}{
+		{"claude", "planner", []string{"claude"}, "arg", true},
+		{"claude", "implementer", []string{"claude"}, "stdin", false},
+		{"claude", "reviewer", []string{"claude"}, "stdin", false},
+		{"claude", "learner", []string{"claude"}, "stdin", false},
+		{"codex", "planner", []string{"codex", "exec"}, "stdin", false},
+		{"codex", "implementer", []string{"codex", "exec", "--sandbox", "workspace-write"}, "stdin", false},
+		{"codex", "reviewer", []string{"codex", "exec"}, "stdin", false},
+		{"codex", "learner", []string{"codex", "exec"}, "stdin", false},
+	}
+
+	for _, tc := range tests {
+		got := presetAgent(tc.harness, tc.role)
+		if !reflect.DeepEqual(got.Command, tc.command) {
+			t.Fatalf("presetAgent(%q, %q).Command = %#v, want %#v", tc.harness, tc.role, got.Command, tc.command)
+		}
+		if got.PromptMode != tc.promptMode {
+			t.Fatalf("presetAgent(%q, %q).PromptMode = %q, want %q", tc.harness, tc.role, got.PromptMode, tc.promptMode)
+		}
+		if got.Interactive != tc.interactive {
+			t.Fatalf("presetAgent(%q, %q).Interactive = %v, want %v", tc.harness, tc.role, got.Interactive, tc.interactive)
+		}
+	}
+}
+
 func TestAgentForRoleLearner(t *testing.T) {
 	cfg := (Config{}).withDefaults()
 	agent, err := agentForRole(cfg, "learn")
