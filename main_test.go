@@ -189,6 +189,83 @@ func TestGitWorktreeFallback(t *testing.T) {
 	}
 }
 
+func TestConfirmRelease(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"y\n", true},
+		{"yes\n", true},
+		{"Y\n", true},
+		{"n\n", false},
+		{"\n", false},
+		{"", false}, // EOF
+	} {
+		if got := confirmRelease(strings.NewReader(tc.in), &bytes.Buffer{}); got != tc.want {
+			t.Errorf("confirmRelease(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestLandCommit(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"commit", "--allow-empty", "-m", "root"},
+	} {
+		if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	wt, _, err := gitWorktree(root, "land-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "NEW.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	branch, changed, err := landCommit(wt, "add a file")
+	if err != nil {
+		t.Fatalf("landCommit() error = %v", err)
+	}
+	if !changed {
+		t.Fatal("changed = false, want true")
+	}
+	if branch != "sidekick/land-run" {
+		t.Fatalf("branch = %q, want sidekick/land-run", branch)
+	}
+	// commit exists on the branch, nothing pushed (no remote configured)
+	out, err := exec.Command("git", "-C", wt, "log", "--oneline", "-1").Output()
+	if err != nil || !strings.Contains(string(out), "sidekick: add a file") {
+		t.Fatalf("commit missing: %q err=%v", out, err)
+	}
+	// second call on a clean tree reports nothing to land
+	if _, changed, err := landCommit(wt, "again"); err != nil || changed {
+		t.Fatalf("clean landCommit: changed=%v err=%v, want false/nil", changed, err)
+	}
+}
+
+func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
+	// go test stdout is not a TTY, so col() must emit no escape codes.
+	state := testRunState(t, false)
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state.TaskFile, []byte("do a thing\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := renderStatus(&buf, state.RunDir, 100); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "\033[") {
+		t.Fatalf("dashboard leaked ANSI escapes to non-tty output:\n%s", buf.String())
+	}
+}
+
 func TestCleanRunsRemovesGitWorktree(t *testing.T) {
 	root := t.TempDir()
 	for _, args := range [][]string{

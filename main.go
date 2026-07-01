@@ -37,6 +37,9 @@ type AgentConfig struct {
 	Name       string   `json:"name"`
 	Command    []string `json:"command"`
 	PromptMode string   `json:"promptMode"`
+	// Interactive runs the harness attached to the pane's TTY (a live chat)
+	// and gates the pipeline on human approval instead of capturing output.
+	Interactive bool `json:"interactive,omitempty"`
 }
 
 type GateConfig struct {
@@ -89,6 +92,8 @@ func run(args []string) error {
 		return waitFile(args[2:])
 	case "clean":
 		return cleanRuns(args[2:])
+	case "land":
+		return landRun(args[2:])
 	case "help", "-h", "--help":
 		return usage()
 	default:
@@ -112,11 +117,12 @@ func usageText() string {
 sidekick orchestrates planner, implementer, and reviewer agent harnesses.
 
 Usage:
-  sidekick [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-attach]
+  sidekick [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-land] [--no-attach]
   sidekick status --run-dir PATH [--watch] [--interval 2s]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
+  sidekick land --repo PATH --run-dir PATH
   sidekick wait-file FILE
   sidekick clean [--repo PATH] [--run ID]
 
@@ -173,6 +179,7 @@ func startRun(args []string) error {
 	planner := fs.String("planner", "", "planner agent name from config")
 	implementer := fs.String("implementer", "", "implementer agent name from config")
 	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
 	noAttach := fs.Bool("no-attach", false, "do not attach to the tmux session after creating it")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -263,7 +270,7 @@ func startRun(args []string) error {
 	if err := writeState(state); err != nil {
 		return err
 	}
-	if err := createTmuxSession(root, cfg, state, gateEnabled); err != nil {
+	if err := createTmuxSession(root, cfg, state, gateEnabled, !*noLand); err != nil {
 		return err
 	}
 
@@ -357,6 +364,19 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	env := append(os.Environ(),
+		"SIDEKICK_RUN_ID="+state.ID,
+		"SIDEKICK_RUN_DIR="+state.RunDir,
+		"SIDEKICK_TASK_FILE="+state.TaskFile,
+		"SIDEKICK_PLAN_FILE="+state.PlanFile,
+		"SIDEKICK_WORKTREE="+state.WorktreePath,
+	)
+
+	if normalizeAgent(agent).Interactive {
+		return runInteractiveAgent(agent, prompt, *promptPath, workDirForRole(state, *role), env, *donePath)
+	}
+
 	if err := os.MkdirAll(filepath.Dir(*outputPath), 0o755); err != nil {
 		return err
 	}
@@ -371,13 +391,7 @@ func runAgent(args []string) error {
 		return err
 	}
 	cmd.Dir = workDirForRole(state, *role)
-	cmd.Env = append(os.Environ(),
-		"SIDEKICK_RUN_ID="+state.ID,
-		"SIDEKICK_RUN_DIR="+state.RunDir,
-		"SIDEKICK_TASK_FILE="+state.TaskFile,
-		"SIDEKICK_PLAN_FILE="+state.PlanFile,
-		"SIDEKICK_WORKTREE="+state.WorktreePath,
-	)
+	cmd.Env = env
 	cmd.Stdin = agentStdin(agent, prompt)
 	cmd.Stdout = io.MultiWriter(os.Stdout, out)
 	// tee stderr to the log too, else agent failures leave an empty log
@@ -395,6 +409,53 @@ func runAgent(args []string) error {
 		}
 	}
 	return nil
+}
+
+// runInteractiveAgent attaches the harness to the pane's TTY (a live chat, no
+// output capture) so its native UI renders, then gates the pipeline on human
+// approval: only "y" releases downstream, anything else aborts it.
+func runInteractiveAgent(agent AgentConfig, prompt []byte, promptPath, dir string, env []string, donePath string) error {
+	cmd, err := commandForAgent(agent, strings.TrimSpace(string(prompt)), promptPath)
+	if err != nil {
+		return err
+	}
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if donePath != "" {
+			_ = markFile(donePath + ".failed")
+		}
+		return err
+	}
+	if donePath == "" {
+		return nil
+	}
+	if confirmRelease(os.Stdin, os.Stdout) {
+		return markFile(donePath)
+	}
+	fmt.Fprintln(os.Stdout, "not released; downstream steps aborted")
+	return markFile(donePath + ".failed")
+}
+
+// confirmRelease asks the human whether to release downstream steps. Only an
+// explicit "y"/"yes" approves; EOF or anything else declines.
+func confirmRelease(in io.Reader, out io.Writer) bool {
+	return promptYesNo(in, out, "\nPlan ready? release implementer? [y/N] ")
+}
+
+// promptYesNo reads one line; only "y"/"yes" is true. EOF/anything else false.
+func promptYesNo(in io.Reader, out io.Writer, question string) bool {
+	fmt.Fprint(out, question)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 func runGate(args []string) error {
@@ -479,9 +540,12 @@ func defaultConfig() Config {
 	return Config{
 		Agents: AgentsConfig{
 			Planner: AgentConfig{
-				Name:       "claude-planner",
-				Command:    []string{"claude"},
-				PromptMode: "stdin",
+				// Interactive claude chat: prompt seeds the session as an arg
+				// (`claude "<prompt>"` stays interactive; -p would be one-shot).
+				Name:        "claude-planner",
+				Command:     []string{"claude"},
+				PromptMode:  "arg",
+				Interactive: true,
 			},
 			Implementer: AgentConfig{
 				// codex exec = non-interactive (bare `codex` is a TUI that rejects
@@ -720,6 +784,87 @@ func runQuiet(name string, args ...string) {
 	_ = exec.Command(name, args...).Run()
 }
 
+// landRun commits the worktree, then (after a prompt) pushes its branch and
+// opens a PR. Commit is local and reversible; the push/PR is the outward action
+// and is gated behind an explicit yes.
+func landRun(args []string) error {
+	fs := flag.NewFlagSet("land", flag.ContinueOnError)
+	_ = fs.String("repo", ".", "repository path") // accepted for symmetry; land uses the worktree from state
+	runDir := fs.String("run-dir", "", "run directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *runDir == "" {
+		return errors.New("--run-dir is required")
+	}
+	state, err := loadState(*runDir)
+	if err != nil {
+		return err
+	}
+	wt := state.WorktreePath
+	if wt == "" {
+		return errors.New("no worktree path in run state")
+	}
+
+	goal := firstLine(state.TaskFile)
+	if goal == "" {
+		goal = state.ID
+	}
+	branch, changed, err := landCommit(wt, goal)
+	if err != nil {
+		return err
+	}
+	if !changed {
+		fmt.Println("nothing to land: worktree has no changes")
+		return nil
+	}
+	fmt.Printf("committed on branch %s\n", branch)
+
+	if !promptYesNo(os.Stdin, os.Stdout, fmt.Sprintf("Push %s and open a PR? [y/N] ", branch)) {
+		fmt.Printf("left local; push later with: git -C %s push -u origin %s\n", wt, branch)
+		return nil
+	}
+
+	push := exec.Command("git", "-C", wt, "push", "-u", "origin", branch)
+	push.Stdout, push.Stderr = os.Stdout, os.Stderr
+	if err := push.Run(); err != nil {
+		return fmt.Errorf("git push: %w", err)
+	}
+	if _, err := exec.LookPath("gh"); err != nil {
+		fmt.Printf("gh not found; open a PR for %s from your git host\n", branch)
+		return nil
+	}
+	pr := exec.Command("gh", "pr", "create", "--fill", "--head", branch)
+	pr.Dir = wt
+	pr.Stdin, pr.Stdout, pr.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return pr.Run()
+}
+
+// landCommit stages and commits the worktree. Returns the current branch and
+// whether anything was committed (false when the worktree was clean).
+func landCommit(wt, goal string) (string, bool, error) {
+	if err := exec.Command("git", "-C", wt, "add", "-A").Run(); err != nil {
+		return "", false, fmt.Errorf("git add: %w", err)
+	}
+	dirty, err := exec.Command("git", "-C", wt, "status", "--porcelain").Output()
+	if err != nil {
+		return "", false, fmt.Errorf("git status: %w", err)
+	}
+	if strings.TrimSpace(string(dirty)) == "" {
+		return "", false, nil
+	}
+	commit := exec.Command("git", "-C", wt, "commit", "-m", "sidekick: "+goal)
+	commit.Stdout, commit.Stderr = os.Stdout, os.Stderr
+	if err := commit.Run(); err != nil {
+		return "", false, fmt.Errorf("git commit: %w", err)
+	}
+	branchOut, err := exec.Command("git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	if err != nil {
+		return "", false, fmt.Errorf("resolve branch: %w", err)
+	}
+	return strings.TrimSpace(string(branchOut)), true, nil
+}
+
 func writeRunFiles(state RunState, task string) error {
 	files := map[string]string{
 		state.TaskFile: task + "\n",
@@ -768,16 +913,17 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 		width = 120
 	}
 
-	fmt.Fprint(w, mascot())
+	fmt.Fprint(w, col("36", mascot()))
 	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", width))
 	fmt.Fprintf(w, "Sidekick run: %s\n", view.State.ID)
-	fmt.Fprintf(w, "Phase: %s | Elapsed: %s\n", view.Phase, view.Elapsed.Round(time.Second))
-	fmt.Fprintf(w, "Goal: %s\n", clip(view.Goal, width-6))
+	fmt.Fprintf(w, "Phase: %s | Elapsed: %s\n", col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
+	fmt.Fprintf(w, "Goal: %s\n", col("1", clip(view.Goal, width-6)))
 	fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", width))
 
 	fmt.Fprintln(w, "Pipeline")
 	for _, step := range view.Steps {
-		fmt.Fprintf(w, "  [%s] %-18s %s\n", statusMark(step.Status), step.Name, step.Status)
+		mark := col(statusColor(step.Status), "["+statusMark(step.Status)+"]")
+		fmt.Fprintf(w, "  %s %-18s %s\n", mark, step.Name, col(statusColor(step.Status), step.Status))
 	}
 
 	fmt.Fprintln(w, "\nArtifacts")
@@ -879,6 +1025,43 @@ func statusRank(status string) int {
 		return 2
 	default:
 		return 3
+	}
+}
+
+// col wraps s in an ANSI color unless NO_COLOR is set or stdout is not a TTY.
+func col(code, s string) string {
+	if code == "" || os.Getenv("NO_COLOR") != "" || !stdoutIsTTY() {
+		return s
+	}
+	return "\033[" + code + "m" + s + "\033[0m"
+}
+
+func stdoutIsTTY() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func phaseColor(phase string) string {
+	switch {
+	case strings.HasPrefix(phase, "failed"):
+		return "31" // red
+	case phase == "complete":
+		return "32" // green
+	default:
+		return "33" // yellow
+	}
+}
+
+func statusColor(status string) string {
+	switch status {
+	case "failed":
+		return "31" // red
+	case "done":
+		return "32" // green
+	case "running":
+		return "33" // yellow
+	default:
+		return "2" // dim
 	}
 }
 
@@ -1011,7 +1194,7 @@ func loadState(runDir string) (RunState, error) {
 	return state, nil
 }
 
-func createTmuxSession(root string, cfg Config, state RunState, gate bool) error {
+func createTmuxSession(root string, cfg Config, state RunState, gate, land bool) error {
 	session := state.TmuxSession
 	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", "planner", "-c", root).Run(); err != nil {
 		return fmt.Errorf("create tmux session: %w", err)
@@ -1090,6 +1273,25 @@ func createTmuxSession(root string, cfg Config, state RunState, gate bool) error
 		}
 	}
 
+	if land {
+		if err := exec.Command("tmux", "new-window", "-t", session, "-n", "land", "-c", state.WorktreePath).Run(); err != nil {
+			return err
+		}
+		landPane, err := tmuxPaneID(session + ":land")
+		if err != nil {
+			return err
+		}
+		// wait for implementation (and the gate, when enabled) before landing
+		landCmd := shellJoin(self(), "wait-file", state.ImplementDone)
+		if gate {
+			landCmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
+		}
+		landCmd += " && " + shellJoin(self(), "land", "--repo", state.WorktreePath, "--run-dir", state.RunDir)
+		if err := tmuxSend(landPane, landCmd); err != nil {
+			return err
+		}
+	}
+
 	return exec.Command("tmux", "select-window", "-t", session+":dashboard").Run()
 }
 
@@ -1153,24 +1355,30 @@ func workDirForRole(state RunState, role string) string {
 }
 
 func plannerPrompt(state RunState) string {
-	return fmt.Sprintf(`# Sidekick planning task
+	return fmt.Sprintf(`# Sidekick planning task (interactive)
 
-You are the planning agent for Sidekick run %s.
+You are the planning agent for Sidekick run %s. This is a back-and-forth chat
+with the human. Discuss and refine the plan with them until they are satisfied.
 
 Read the task in:
 %s
 
-Create a concrete, reachable implementation plan. Keep it focused enough for an implementation agent to execute without more user back-and-forth.
-
-Required output:
+Produce a concrete, reachable implementation plan an implementation agent can
+execute without further human back-and-forth:
 - Goal statement.
 - Assumptions.
 - Ordered implementation steps.
 - Validation steps.
 - Risks or decisions that still require the human.
 
-Do not edit files. Write only the plan.
-`, state.ID, state.TaskFile)
+When the human is happy, WRITE the final plan to this file (path is also in
+$SIDEKICK_PLAN_FILE):
+%s
+
+Do not edit any other files -- write only the plan file. When the plan file is
+saved and the human is done, end the session; Sidekick will ask them to release
+the implementer.
+`, state.ID, state.TaskFile, state.PlanFile)
 }
 
 func implementerPrompt(state RunState) string {
@@ -1184,7 +1392,7 @@ Task file:
 Plan file:
 %s
 
-Work in this isolated treehouse worktree:
+Work in this isolated worktree:
 %s
 
 Execute the plan with the smallest correct change. Keep the worktree reviewable:

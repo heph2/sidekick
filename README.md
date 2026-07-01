@@ -16,11 +16,15 @@ This is the first executable slice. Sidekick does not replace `claude`, `cc`, `c
 
 The default flow is:
 
-1. planner runs in the target repo and writes `.sidekick/runs/<id>/plan.md`
-2. implementer waits for the plan, then works in an isolated worktree
+1. planner runs as an interactive chat in the target repo; you refine the plan,
+   it writes `.sidekick/runs/<id>/plan.md`, and Sidekick asks you to release the
+   implementer before anything else starts
+2. implementer waits for your approval, then works autonomously in an isolated worktree
 3. reviewers wait for implementation to finish, then review the git diff
-4. the dashboard window tracks goal, phase, artifacts, and recent output
+4. the dashboard window tracks goal, phase, artifacts, and recent output (with color on a TTY)
 5. optional gate window runs `no-mistakes -y`
+6. land window commits the worktree, then prompts before pushing the branch and
+   opening a PR via `gh` (skip with `--no-land`)
 
 ## Requirements
 
@@ -28,6 +32,7 @@ The default flow is:
 - `go`
 - `tmux`
 - the configured agent CLIs, for example `claude`, `cc`, or `codex`
+- optional: `gh` (to open the PR in the land step; without it, push and open the PR by hand)
 - optional: `treehouse` (falls back to a plain git worktree when absent)
 - optional: `no-mistakes`
 
