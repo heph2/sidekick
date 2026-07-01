@@ -9,29 +9,34 @@ It keeps the human in one conversation while coordinating the noisy parts:
 - review by multiple harnesses, looping back into implementation when changes are requested
 - optional `no-mistakes` gating after implementation
 - repo-local memory that records what happened and durable lessons for future runs
-- one tmux workspace with a live dashboard for visibility without constant pane switching
+- one tmux workspace with a fixed live dashboard for visibility without constant pane switching
 
 ## Current shape
 
 This is the first executable slice. Sidekick does not replace `claude`, `cc`, `codex`, Treehouse, or `no-mistakes`; it coordinates them.
 
-The default flow is:
+The default console flow is:
 
 1. planner runs as an interactive chat in the target repo; you refine the plan,
    it writes `.sidekick/runs/<id>/plan.md`, and Sidekick asks you to release the
    implementer before anything else starts
-2. `sidekick cycle` waits for your approval, then runs the implementer in an
-   isolated worktree and runs reviewers against the result
-3. if any reviewer requests changes, Sidekick writes reviewer feedback and
+2. release or abort from the console with `/release [tN]` or `/abort [tN]`
+3. `sidekick cycle` waits for your approval, then works headlessly in an isolated
+   worktree: it runs the implementer, then runs reviewers against the result
+4. if any reviewer requests changes, Sidekick writes reviewer feedback and
    reruns the implementer; the loop repeats until all reviewers approve or
    `maxReviewCycles` is reached
-4. learner waits for implementation approval, then updates `.sidekick/memory.md` with a
+5. learner waits for implementation approval, then updates `.sidekick/memory.md` with a
    run entry and concise repo insights (skip with `--no-learn`)
-5. the dashboard window tracks goal, phase, artifacts, and recent output (with color on a TTY)
-6. optional gate window runs `no-mistakes -y`; when enabled, learner and land wait for it
-7. land window commits the worktree, then prompts before pushing the branch and
-   opening a PR via `gh`; when learning is enabled, land waits for it first so
-   the learner can inspect the uncommitted diff (skip with `--no-land`)
+6. the shared dashboard window tracks every console run, its phase, pipeline
+   status, and recent output (with color on a TTY)
+7. optional gate runs `no-mistakes -y` headlessly; when enabled, learner and land wait for it
+8. land commits the worktree headlessly, then waits for `/ship [tN]` before
+   pushing the branch and opening a PR via `gh`; when learning is enabled, land
+   waits for it first so the learner can inspect the uncommitted diff (skip with
+   `--no-land`)
+
+`sidekick run` remains the windowed one-shot path for scripts and CI-style use.
 
 ## Requirements
 
@@ -52,7 +57,8 @@ go build -o bin/sidekick .
 ```
 
 Start a run from inside any git repo. With no arguments, Sidekick prompts for
-the task, leases a worktree, and attaches to the dashboard:
+tasks in a persistent console, leases a worktree for each task, and opens a
+shared dashboard:
 
 ```sh
 cd /path/to/project
@@ -67,20 +73,20 @@ the agent commands (see Config below).
 Pass the task inline, or pipe it in, instead of the prompt:
 
 ```sh
-sidekick --task "Implement the requested feature and validate it"
-echo "Implement the requested feature and validate it" | sidekick --no-attach
+sidekick run --task "Implement the requested feature and validate it"
+echo "Implement the requested feature and validate it" | sidekick run --no-attach
 ```
 
 With the gate, and without auto-attaching:
 
 ```sh
-sidekick --task "Implement the requested feature and validate it" --gate --no-attach
+sidekick run --task "Implement the requested feature and validate it" --gate --no-attach
 ```
 
 Skip the post-run learner for a one-off run:
 
 ```sh
-sidekick --task "Try an experiment" --no-learn
+sidekick run --task "Try an experiment" --no-learn
 ```
 
 Render a run dashboard without attaching to tmux:
@@ -95,7 +101,17 @@ Watch it live:
 bin/sidekick status --run-dir /path/to/project/.sidekick/runs/<id> --watch
 ```
 
-The dashboard includes the Sidekick wood-hero ASCII mascot, the current phase, pipeline status, run artifacts, and recent agent output.
+Render the shared dashboard for every run in a repo:
+
+```sh
+bin/sidekick status --all --repo /path/to/project
+```
+
+Inside `sidekick console`, use `/help` to list commands. Common commands are
+`/list`, `/release [tN]`, `/abort [tN]`, `/ship [tN]`, `/status [tN]`, and
+`/attach <tN> <stage>` to tail a headless stage log in a temporary tmux window.
+
+The dashboard includes the Sidekick ASCII mascot, the current phase, pipeline status, run artifacts, and recent agent output.
 
 ## Config
 
