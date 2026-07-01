@@ -188,6 +188,38 @@ func TestConfigDefaults(t *testing.T) {
 	}
 }
 
+func TestPresetAgent(t *testing.T) {
+	tests := []struct {
+		harness     string
+		role        string
+		command     []string
+		promptMode  string
+		interactive bool
+	}{
+		{"claude", "planner", []string{"claude"}, "arg", true},
+		{"claude", "implementer", []string{"claude"}, "stdin", false},
+		{"claude", "reviewer", []string{"claude"}, "stdin", false},
+		{"claude", "learner", []string{"claude"}, "stdin", false},
+		{"codex", "planner", []string{"codex", "exec"}, "stdin", false},
+		{"codex", "implementer", []string{"codex", "exec", "--sandbox", "workspace-write"}, "stdin", false},
+		{"codex", "reviewer", []string{"codex", "exec"}, "stdin", false},
+		{"codex", "learner", []string{"codex", "exec"}, "stdin", false},
+	}
+
+	for _, tc := range tests {
+		got := presetAgent(tc.harness, tc.role)
+		if !reflect.DeepEqual(got.Command, tc.command) {
+			t.Fatalf("presetAgent(%q, %q).Command = %#v, want %#v", tc.harness, tc.role, got.Command, tc.command)
+		}
+		if got.PromptMode != tc.promptMode {
+			t.Fatalf("presetAgent(%q, %q).PromptMode = %q, want %q", tc.harness, tc.role, got.PromptMode, tc.promptMode)
+		}
+		if got.Interactive != tc.interactive {
+			t.Fatalf("presetAgent(%q, %q).Interactive = %v, want %v", tc.harness, tc.role, got.Interactive, tc.interactive)
+		}
+	}
+}
+
 func TestAgentForRoleLearner(t *testing.T) {
 	cfg := (Config{}).withDefaults()
 	agent, err := agentForRole(cfg, "learn")
@@ -348,14 +380,14 @@ func TestBuildStatusViewOmitsLearnWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestRenderStatusIncludesMascotAndArtifacts(t *testing.T) {
+func TestRenderStatusIncludesHeaderAndArtifacts(t *testing.T) {
 	state := testRunState(t, false)
 	var out bytes.Buffer
-	if err := renderStatus(&out, state.RunDir, 80); err != nil {
+	if err := renderStatus(&out, state.RunDir, 80, 0); err != nil {
 		t.Fatalf("renderStatus() error = %v", err)
 	}
 	text := out.String()
-	for _, want := range []string{"Sidekick", "always-on companion", "Ship the dashboard", "worktree:"} {
+	for _, want := range []string{"Sidekick", "Ship the dashboard", "worktree:"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, text)
 		}
@@ -493,7 +525,7 @@ func TestLandCommit(t *testing.T) {
 }
 
 func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
-	// go test stdout is not a TTY, so col() and the mascot's fg() must emit no
+	// go test stdout is not a TTY, so col() and the spinner's fg() must emit no
 	// escape codes.
 	state := testRunState(t, false)
 	if err := writeState(state); err != nil {
@@ -503,14 +535,14 @@ func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := renderStatus(&buf, state.RunDir, 100); err != nil {
+	if err := renderStatus(&buf, state.RunDir, 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(buf.String(), "\033[") {
 		t.Fatalf("dashboard leaked ANSI escapes to non-tty output:\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), "Sidekick") {
-		t.Fatalf("dashboard missing plain mascot text:\n%s", buf.String())
+		t.Fatalf("dashboard missing plain wordmark text:\n%s", buf.String())
 	}
 }
 
