@@ -67,6 +67,7 @@ type GateConfig struct {
 
 type RunState struct {
 	ID              string    `json:"id"`
+	ConsoleLabel    string    `json:"consoleLabel,omitempty"`
 	CreatedAt       time.Time `json:"createdAt"`
 	RepoRoot        string    `json:"repoRoot"`
 	RunDir          string    `json:"runDir"`
@@ -81,6 +82,7 @@ type RunState struct {
 	TmuxSession     string    `json:"tmuxSession"`
 	GateEnabled     bool      `json:"gateEnabled"`
 	LearnEnabled    bool      `json:"learnEnabled"`
+	LandEnabled     bool      `json:"landEnabled"`
 	PlannerName     string    `json:"plannerName"`
 	ImplementerName string    `json:"implementerName"`
 	LearnerName     string    `json:"learnerName"`
@@ -118,6 +120,8 @@ func run(args []string) error {
 		return cleanRuns(args[2:])
 	case "land":
 		return landRun(args[2:])
+	case "ship":
+		return shipRun(args[2:])
 	case "release":
 		return signalPlanner(args[2:], false)
 	case "abort":
@@ -149,10 +153,12 @@ Usage:
   sidekick run [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-learn] [--no-land] [--no-attach]
   sidekick console [--repo PATH] [--gate] [--no-learn] [--no-land]
   sidekick status --run-dir PATH [--watch] [--interval 2s]
+  sidekick status --all [--repo PATH] [--watch] [--interval 2s]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
   sidekick land --repo PATH --run-dir PATH
+  sidekick ship [--repo PATH] [--run-dir PATH]      # approve landing
   sidekick release [--repo PATH] [--run-dir PATH]   # approve the newest waiting plan
   sidekick abort   [--repo PATH] [--run-dir PATH]   # cancel it instead
   sidekick wait-file FILE
@@ -266,7 +272,7 @@ func startRun(args []string) error {
 		return err
 	}
 
-	state, err := spawnRun(session, "", root, cfg, taskText, gateEnabled, !*noLearn, !*noLand)
+	state, err := spawnRun(session, "", root, cfg, taskText, gateEnabled, !*noLearn, !*noLand, false)
 	if err != nil {
 		return err
 	}
@@ -364,6 +370,18 @@ func startConsole(args []string) error {
 	if err := tmuxSend(consolePane, consoleCmd); err != nil {
 		return err
 	}
+	dashboardCmd := shellJoin(self(), "status", "--all", "--watch", "--repo", root)
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", "dashboard", "-c", root).Run(); err != nil {
+		return fmt.Errorf("create dashboard window: %w", err)
+	}
+	dashboardPane, err := tmuxPaneID(session + ":dashboard")
+	if err != nil {
+		return err
+	}
+	if err := tmuxSend(dashboardPane, dashboardCmd); err != nil {
+		return err
+	}
+	_ = exec.Command("tmux", "select-window", "-t", session+":console").Run()
 
 	fmt.Printf("session: %s\n", session)
 	if *noAttach {
@@ -412,10 +430,11 @@ func consoleLoop(args []string) error {
 	land := !*noLand
 	learn := !*noLearn
 	in := bufio.NewReader(os.Stdin)
+	runs := map[string]RunState{}
 	for idx := 1; ; idx++ {
 		fmt.Print(mascotColored())
 		fmt.Println()
-		fmt.Println("Give Sidekick a task; each one gets its own windows. Type quit/exit to leave the console.")
+		fmt.Println("Give Sidekick a task. Slash commands: /help, /list, /release, /abort, /ship, /attach, /status.")
 
 		taskText, eof, err := consoleReadLine(in)
 		if err != nil {
@@ -428,19 +447,27 @@ func consoleLoop(args []string) error {
 			idx--
 			continue
 		}
-		switch strings.ToLower(taskText) {
-		case "quit", "exit":
+		parsed := parseConsoleInput(taskText)
+		if parsed.Kind == "exit" {
 			return nil
 		}
+		if parsed.Kind == "command" {
+			if err := handleConsoleCommand(parsed, root, session, runs); err != nil {
+				fmt.Fprintf(os.Stderr, "sidekick: %v\n", err)
+			}
+			idx--
+			continue
+		}
 
-		prefix := fmt.Sprintf("t%d-", idx)
-		state, err := spawnRun(session, prefix, root, cfg, taskText, gateEnabled, learn, land)
+		label := fmt.Sprintf("t%d", idx)
+		state, err := spawnRun(session, label, root, cfg, parsed.Task, gateEnabled, learn, land, true)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sidekick: %v\n", err)
 			idx--
 			continue
 		}
-		fmt.Printf("run %s started; windows %s*\n\n", state.ID, prefix)
+		runs[label] = state
+		fmt.Printf("run %s (%s) started - planner in %s-planner; watch the dashboard\n\n", label, state.ID, label)
 	}
 }
 
@@ -457,6 +484,200 @@ func consoleReadLine(in *bufio.Reader) (line string, eof bool, err error) {
 		return "", false, err
 	}
 	return strings.TrimSpace(text), false, nil
+}
+
+type consoleInput struct {
+	Kind    string
+	Command string
+	Args    []string
+	Task    string
+}
+
+func parseConsoleInput(line string) consoleInput {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return consoleInput{}
+	}
+	lower := strings.ToLower(line)
+	if lower == "quit" || lower == "exit" || lower == "/quit" || lower == "/exit" {
+		return consoleInput{Kind: "exit"}
+	}
+	if strings.HasPrefix(line, "/") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			return consoleInput{}
+		}
+		return consoleInput{
+			Kind:    "command",
+			Command: strings.ToLower(strings.TrimPrefix(fields[0], "/")),
+			Args:    append([]string(nil), fields[1:]...),
+		}
+	}
+	return consoleInput{Kind: "task", Task: line}
+}
+
+func handleConsoleCommand(input consoleInput, root, session string, runs map[string]RunState) error {
+	switch input.Command {
+	case "help":
+		fmt.Println("commands: /release [tN], /abort [tN], /ship [tN], /list, /status [tN], /attach <tN> <stage>, /kill <tN>, /quit")
+		return nil
+	case "list":
+		printConsoleRuns(runs)
+		return nil
+	case "release":
+		if len(input.Args) > 1 {
+			return errors.New("usage: /release [tN]")
+		}
+		if len(input.Args) == 0 {
+			return signalPlanner([]string{"--repo", root}, false)
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		return signalPlanner([]string{"--run-dir", state.RunDir}, false)
+	case "abort":
+		if len(input.Args) > 1 {
+			return errors.New("usage: /abort [tN]")
+		}
+		if len(input.Args) == 0 {
+			return signalPlanner([]string{"--repo", root}, true)
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		return signalPlanner([]string{"--run-dir", state.RunDir}, true)
+	case "ship":
+		if len(input.Args) > 1 {
+			return errors.New("usage: /ship [tN]")
+		}
+		if len(input.Args) == 0 {
+			return shipRun([]string{"--repo", root})
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		return shipRun([]string{"--run-dir", state.RunDir})
+	case "status":
+		if len(input.Args) > 1 {
+			return errors.New("usage: /status [tN]")
+		}
+		if len(input.Args) == 0 {
+			return renderAllStatus(os.Stdout, root, terminalWidth())
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		return renderStatus(os.Stdout, state.RunDir, terminalWidth())
+	case "attach":
+		if len(input.Args) != 2 {
+			return errors.New("usage: /attach <tN> <stage>")
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		return attachConsoleLog(session, state, input.Args[1])
+	case "kill":
+		if len(input.Args) != 1 {
+			return errors.New("usage: /kill <tN>")
+		}
+		state, err := resolveConsoleRun(input.Args[0], runs)
+		if err != nil {
+			return err
+		}
+		if !fileExists(state.PlannerDone) && !fileExists(state.PlannerDone+".failed") {
+			if err := markFile(state.PlannerDone + ".failed"); err != nil {
+				return err
+			}
+			fmt.Printf("aborted %s; already-running headless stages are not killed\n", state.ConsoleLabel)
+			return nil
+		}
+		fmt.Printf("%s is already past planning; already-running headless stages are not killed\n", state.ConsoleLabel)
+		return nil
+	default:
+		return fmt.Errorf("unknown command /%s; try /help", input.Command)
+	}
+}
+
+func printConsoleRuns(runs map[string]RunState) {
+	if len(runs) == 0 {
+		fmt.Println("no runs started in this console")
+		return
+	}
+	labels := sortedRunLabels(runs)
+	for _, label := range labels {
+		state := runs[label]
+		phase := "unknown"
+		if view, err := buildStatusView(state.RunDir); err == nil {
+			phase = view.Phase
+		}
+		fmt.Printf("%s -> %s  %s  %s\n", label, state.ID, phase, firstLine(state.TaskFile))
+	}
+}
+
+func sortedRunLabels(runs map[string]RunState) []string {
+	labels := make([]string, 0, len(runs))
+	for label := range runs {
+		labels = append(labels, label)
+	}
+	sort.Slice(labels, func(i, j int) bool {
+		return labelNumber(labels[i]) < labelNumber(labels[j])
+	})
+	return labels
+}
+
+func labelNumber(label string) int {
+	var n int
+	if _, err := fmt.Sscanf(label, "t%d", &n); err == nil {
+		return n
+	}
+	return 0
+}
+
+func resolveConsoleRun(target string, runs map[string]RunState) (RunState, error) {
+	if state, ok := runs[target]; ok {
+		return state, nil
+	}
+	for _, state := range runs {
+		if state.ID == target || strings.HasPrefix(state.ID, target) {
+			return state, nil
+		}
+	}
+	return RunState{}, fmt.Errorf("unknown run %q", target)
+}
+
+func attachConsoleLog(session string, state RunState, stage string) error {
+	logPath, err := logForStage(state, stage)
+	if err != nil {
+		return err
+	}
+	name := stageWindowName(state.ConsoleLabel, stage)
+	cmd := "touch " + shellQuote(logPath) + " && tail -f " + shellQuote(logPath)
+	return exec.Command("tmux", "new-window", "-t", session, "-n", name, "-c", state.RunDir, shellJoin("sh", "-c", cmd)).Run()
+}
+
+func logForStage(state RunState, stage string) (string, error) {
+	stage = strings.TrimSpace(strings.ToLower(stage))
+	switch stage {
+	case "implement", "implementer":
+		return implementerLog(state), nil
+	case "gate":
+		return gateLog(state), nil
+	case "learn", "learner":
+		return learnLog(state), nil
+	case "land", "ship":
+		return landLog(state), nil
+	}
+	for _, reviewer := range state.ReviewerNames {
+		if stage == "review-"+slug(reviewer) || stage == slug(reviewer) || stage == "reviewer-"+slug(reviewer) {
+			return reviewerLog(state, reviewer), nil
+		}
+	}
+	return "", fmt.Errorf("unknown stage %q", stage)
 }
 
 // readTask sources the task when --task is absent: an interactive prompt on a
@@ -481,10 +702,28 @@ func readTask() (string, error) {
 func showStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	runDir := fs.String("run-dir", "", "run directory")
+	repo := fs.String("repo", ".", "target repository")
+	all := fs.Bool("all", false, "show all runs for the repository")
 	watch := fs.Bool("watch", false, "redraw status until interrupted")
 	interval := fs.Duration("interval", 2*time.Second, "watch redraw interval")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *all {
+		root, err := repoRoot(*repo)
+		if err != nil {
+			return err
+		}
+		if *watch {
+			for {
+				fmt.Print("\033[H\033[2J")
+				if err := renderAllStatus(os.Stdout, root, terminalWidth()); err != nil {
+					return err
+				}
+				time.Sleep(*interval)
+			}
+		}
+		return renderAllStatus(os.Stdout, root, terminalWidth())
 	}
 	if *runDir == "" {
 		return errors.New("--run-dir is required")
@@ -1036,16 +1275,20 @@ func landRun(args []string) error {
 		return errors.New("no worktree path in run state")
 	}
 
-	goal := firstLine(state.TaskFile)
-	if goal == "" {
-		goal = state.ID
+	title, body := planSummary(state.PlanFile, state.TaskFile, state.ID)
+	if title == "" {
+		title = state.ID
 	}
-	branch, changed, err := landCommit(wt, goal)
+	branch, changed, err := landCommit(wt, title)
 	if err != nil {
+		_ = markFile(landDone(state) + ".failed")
 		return err
 	}
 	if !changed {
 		fmt.Println("nothing to land: worktree has no changes")
+		if err := markFile(landDone(state)); err != nil {
+			return err
+		}
 		return nil
 	}
 	fmt.Printf("committed on branch %s\n", branch)
@@ -1055,24 +1298,47 @@ func landRun(args []string) error {
 		return err
 	}
 	notify(cfg, "Sidekick: ready to push "+branch+" and open a PR")
-	if !promptYesNo(os.Stdin, os.Stdout, fmt.Sprintf("Push %s and open a PR? [y/N] ", branch)) {
-		fmt.Printf("left local; push later with: git -C %s push -u origin %s\n", wt, branch)
-		return nil
+	if stdinIsTTY() {
+		if !promptYesNo(os.Stdin, os.Stdout, fmt.Sprintf("Push %s and open a PR? [y/N] ", branch)) {
+			fmt.Printf("left local; push later with: git -C %s push -u origin %s\n", wt, branch)
+			return nil
+		}
+	} else {
+		if err := markFile(landReady(state)); err != nil {
+			_ = markFile(landDone(state) + ".failed")
+			return err
+		}
+		fmt.Printf("ready to ship %s; run: sidekick ship --run-dir %s\n", branch, state.RunDir)
+		if err := waitFile([]string{landApprove(state)}); err != nil {
+			_ = markFile(landDone(state) + ".failed")
+			return err
+		}
 	}
 
 	push := exec.Command("git", "-C", wt, "push", "-u", "origin", branch)
 	push.Stdout, push.Stderr = os.Stdout, os.Stderr
 	if err := push.Run(); err != nil {
+		_ = markFile(landDone(state) + ".failed")
 		return fmt.Errorf("git push: %w", err)
 	}
 	if _, err := exec.LookPath("gh"); err != nil {
 		fmt.Printf("gh not found; open a PR for %s from your git host\n", branch)
-		return nil
+		return markFile(landDone(state))
 	}
-	pr := exec.Command("gh", "pr", "create", "--fill", "--head", branch)
+	prArgs := []string{"pr", "create", "--head", branch}
+	if title != "" || body != "" {
+		prArgs = append(prArgs, "--title", title, "--body", body)
+	} else {
+		prArgs = append(prArgs, "--fill")
+	}
+	pr := exec.Command("gh", prArgs...)
 	pr.Dir = wt
-	pr.Stdin, pr.Stdout, pr.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return pr.Run()
+	pr.Stdout, pr.Stderr = os.Stdout, os.Stderr
+	if err := pr.Run(); err != nil {
+		_ = markFile(landDone(state) + ".failed")
+		return err
+	}
+	return markFile(landDone(state))
 }
 
 // landCommit stages and commits the worktree. Returns the current branch and
@@ -1098,6 +1364,134 @@ func landCommit(wt, goal string) (string, bool, error) {
 		return "", false, fmt.Errorf("resolve branch: %w", err)
 	}
 	return strings.TrimSpace(string(branchOut)), true, nil
+}
+
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func shipRun(args []string) error {
+	fs := flag.NewFlagSet("ship", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "repository path")
+	runDir := fs.String("run-dir", "", "run directory (default: newest run ready to land)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dir := *runDir
+	if dir == "" {
+		root, err := repoRoot(*repo)
+		if err != nil {
+			return err
+		}
+		dir, err = findReadyLandRun(root)
+		if err != nil {
+			return err
+		}
+	}
+	state, err := loadState(dir)
+	if err != nil {
+		return err
+	}
+	if fileExists(landDone(state)) {
+		return fmt.Errorf("already landed: %s", filepath.Base(dir))
+	}
+	if !fileExists(landReady(state)) {
+		return fmt.Errorf("run is not ready to ship: %s", filepath.Base(dir))
+	}
+	if fileExists(landApprove(state)) {
+		return fmt.Errorf("already approved: %s", filepath.Base(dir))
+	}
+	if err := markFile(landApprove(state)); err != nil {
+		return err
+	}
+	fmt.Printf("shipping %s; land continues within ~2s\n", filepath.Base(dir))
+	return nil
+}
+
+func findReadyLandRun(root string) (string, error) {
+	entries, err := os.ReadDir(filepath.Join(root, runRoot))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", errors.New("no runs found")
+		}
+		return "", err
+	}
+	best := ""
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, runRoot, e.Name())
+		state, err := loadState(dir)
+		if err != nil {
+			continue
+		}
+		if !fileExists(landReady(state)) || fileExists(landApprove(state)) || fileExists(landDone(state)) {
+			continue
+		}
+		if best == "" || e.Name() > filepath.Base(best) {
+			best = dir
+		}
+	}
+	if best == "" {
+		return "", errors.New("no run is ready to ship")
+	}
+	return best, nil
+}
+
+func planSummary(planFile, taskFile, runID string) (string, string) {
+	goal := goalSection(planFile)
+	fallback := firstLine(taskFile)
+	if fallback == "unavailable" || fallback == "empty task" {
+		fallback = runID
+	}
+	if strings.TrimSpace(goal) == "" {
+		title := clip(strings.TrimSpace(fallback), 70)
+		return title, fmt.Sprintf("%s\n\nRun: %s", title, runID)
+	}
+	title := clip(firstSentence(goal), 70)
+	if strings.TrimSpace(title) == "" {
+		title = clip(strings.TrimSpace(fallback), 70)
+	}
+	body := strings.TrimSpace(goal) + "\n\nPlan: " + filepath.ToSlash(filepath.Join(".sidekick", "runs", runID, "plan.md")) + "\nRun: " + runID
+	return title, body
+}
+
+func goalSection(planFile string) string {
+	data, err := os.ReadFile(planFile)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	inGoal := false
+	var goal []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "## ") {
+			if inGoal {
+				break
+			}
+			if strings.EqualFold(trimmed, "## Goal") {
+				inGoal = true
+			}
+			continue
+		}
+		if inGoal {
+			goal = append(goal, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(goal, "\n"))
+}
+
+func firstSentence(text string) string {
+	text = strings.Join(strings.Fields(text), " ")
+	for i, r := range text {
+		if r == '.' || r == '!' || r == '?' {
+			return strings.TrimSpace(text[:i+1])
+		}
+	}
+	return strings.TrimSpace(text)
 }
 
 func writeRunFiles(state RunState, task string, cfg Config) error {
@@ -1202,6 +1596,88 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 	return nil
 }
 
+const allStatusLimit = 8
+
+func renderAllStatus(w io.Writer, root string, width int) error {
+	views, err := allStatusViews(root)
+	if err != nil {
+		return err
+	}
+	if width < 60 {
+		width = 60
+	}
+	if width > 120 {
+		width = 120
+	}
+
+	fmt.Fprint(w, mascotColored())
+	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", width))
+	fmt.Fprintf(w, "Sidekick runs: %s\n", root)
+	fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", width))
+	if len(views) == 0 {
+		fmt.Fprintln(w, "No runs yet.")
+		return nil
+	}
+
+	shown := len(views)
+	if shown > allStatusLimit {
+		shown = allStatusLimit
+	}
+	for i := 0; i < shown; i++ {
+		view := views[i]
+		label := view.State.ConsoleLabel
+		if label == "" {
+			label = clip(view.State.ID, 14)
+		}
+		fmt.Fprintf(w, "%-14s %-18s %s\n", label, col(phaseColor(view.Phase), view.Phase), clip(view.Goal, width-36))
+		fmt.Fprintf(w, "  %s\n", compactPipeline(view.Steps, width-4))
+		recent := "waiting for agent output..."
+		if len(view.RecentLines) > 0 {
+			recent = view.RecentTitle + ": " + view.RecentLines[len(view.RecentLines)-1]
+		}
+		fmt.Fprintf(w, "  %s\n\n", clip(recent, width-4))
+	}
+	// ponytail: keep the shared dashboard compact; older runs remain on disk.
+	if hidden := len(views) - shown; hidden > 0 {
+		fmt.Fprintf(w, "+%d more\n", hidden)
+	}
+	return nil
+}
+
+func allStatusViews(root string) ([]StatusView, error) {
+	runsDir := filepath.Join(root, runRoot)
+	entries, err := os.ReadDir(runsDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var views []StatusView
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		view, err := buildStatusView(filepath.Join(runsDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		views = append(views, view)
+	}
+	sort.SliceStable(views, func(i, j int) bool {
+		return views[i].State.CreatedAt.After(views[j].State.CreatedAt)
+	})
+	return views, nil
+}
+
+func compactPipeline(steps []PipelineStep, width int) string {
+	var parts []string
+	for _, step := range steps {
+		parts = append(parts, col(statusColor(step.Status), "["+statusMark(step.Status)+"]")+" "+step.Name)
+	}
+	return clip(strings.Join(parts, "  "), width)
+}
+
 func buildStatusView(runDir string) (StatusView, error) {
 	state, err := loadState(runDir)
 	if err != nil {
@@ -1231,6 +1707,16 @@ func buildStatusView(runDir string) (StatusView, error) {
 		}
 		view.Steps = append(view.Steps, PipelineStep{Name: "learn", Status: gatedStepStatus(prerequisite, state.LearnDone, log), Log: log})
 	}
+	if state.LandEnabled {
+		prerequisite := state.ImplementDone
+		if state.GateEnabled {
+			prerequisite = gateDone(state)
+		}
+		if state.LearnEnabled {
+			prerequisite = state.LearnDone
+		}
+		view.Steps = append(view.Steps, PipelineStep{Name: "land", Status: landStepStatus(prerequisite, state), Log: landLog(state)})
+	}
 	view.Phase = currentPhase(view.Steps)
 	view.RecentTitle, view.RecentLines = recentOutput(view.Steps)
 	return view, nil
@@ -1254,6 +1740,23 @@ func gatedStepStatus(prerequisiteDonePath, donePath, logPath string) string {
 		return "waiting"
 	}
 	return stepStatus(donePath, logPath)
+}
+
+func landStepStatus(prerequisiteDonePath string, state RunState) string {
+	if !fileExists(prerequisiteDonePath) {
+		return "waiting"
+	}
+	done := landDone(state)
+	if fileExists(done + ".failed") {
+		return "failed"
+	}
+	if fileExists(done) {
+		return "done"
+	}
+	if fileExists(landReady(state)) || fileExists(landLog(state)) {
+		return "running"
+	}
+	return "waiting"
 }
 
 func currentPhase(steps []PipelineStep) string {
@@ -1405,6 +1908,22 @@ func gateDone(state RunState) string {
 
 func learnLog(state RunState) string {
 	return filepath.Join(state.RunDir, "learn.log")
+}
+
+func landLog(state RunState) string {
+	return filepath.Join(state.RunDir, "land.log")
+}
+
+func landReady(state RunState) string {
+	return filepath.Join(state.RunDir, "land.ready")
+}
+
+func landApprove(state RunState) string {
+	return filepath.Join(state.RunDir, "land.approve")
+}
+
+func landDone(state RunState) string {
+	return filepath.Join(state.RunDir, "land.done")
 }
 
 func markFile(path string) error {
@@ -1580,139 +2099,155 @@ func loadState(runDir string) (RunState, error) {
 	return state, nil
 }
 
-// addRunWindows adds one run's windows (planner, dashboard, implement, review,
-// optional gate, optional learn, optional land) to an existing tmux session, with every window
-// name prefixed so multiple runs can coexist in the same session. It expects
-// the session (or an empty placeholder window) to already exist and creates
-// its own prefix+"planner" window rather than reusing whatever window is
-// current, so it is safe to call into a session that already hosts other
-// runs. It does not create the session and does not select a window -
-// callers that own the session decide that.
-func addRunWindows(session, prefix string, cfg Config, state RunState, gate, learn, land bool) error {
-	plannerWin := prefix + "planner"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", plannerWin, "-c", state.RepoRoot).Run(); err != nil {
-		return fmt.Errorf("create planner window: %w", err)
-	}
-	plannerPane, err := tmuxPaneID(session + ":" + plannerWin)
-	if err != nil {
-		return err
-	}
-	plannerCmd := shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "planner", "--prompt", filepath.Join(state.RunDir, "planner.prompt.md"), "--output", state.PlanFile, "--done", state.PlannerDone)
-	if err := tmuxSend(plannerPane, plannerCmd); err != nil {
-		return err
-	}
+type runStage struct {
+	Name        string
+	Dir         string
+	Cmd         string
+	Log         string
+	Interactive bool
+}
 
-	dashboardWin := prefix + "dashboard"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", dashboardWin, "-c", state.WorktreePath).Run(); err != nil {
-		return err
+func stageCommands(cfg Config, state RunState, gate, learn, land bool) []runStage {
+	stages := []runStage{
+		{
+			Name:        "planner",
+			Dir:         state.RepoRoot,
+			Cmd:         shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "planner", "--prompt", filepath.Join(state.RunDir, "planner.prompt.md"), "--output", state.PlanFile, "--done", state.PlannerDone),
+			Log:         state.PlanFile,
+			Interactive: true,
+		},
+		{
+			Name: "implement",
+			Dir:  state.WorktreePath,
+			Cmd:  shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", "implementer", "--prompt", filepath.Join(state.RunDir, "implementer.prompt.md"), "--output", implementerLog(state), "--done", state.ImplementDone),
+			Log:  implementerLog(state),
+		},
 	}
-	dashboardPane, err := tmuxPaneID(session + ":" + dashboardWin)
-	if err != nil {
-		return err
+	for _, reviewer := range cfg.Agents.Reviewers {
+		role := "reviewer-" + slug(reviewer.Name)
+		output := reviewerLog(state, reviewer.Name)
+		stages = append(stages, runStage{
+			Name: "review-" + slug(reviewer.Name),
+			Dir:  state.WorktreePath,
+			Cmd:  shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", role, "--prompt", filepath.Join(state.RunDir, role+".prompt.md"), "--output", output, "--done", reviewerDone(state, reviewer.Name)),
+			Log:  output,
+		})
 	}
-	dashboardCmd := shellJoin(self(), "status", "--run-dir", state.RunDir, "--watch")
-	if err := tmuxSend(dashboardPane, dashboardCmd); err != nil {
-		return err
+	if gate {
+		stages = append(stages, runStage{
+			Name: "gate",
+			Dir:  state.WorktreePath,
+			Cmd:  shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "gate", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--output", gateLog(state), "--done", gateDone(state)),
+			Log:  gateLog(state),
+		})
 	}
+	if learn {
+		cmd := shellJoin(self(), "wait-file", state.ImplementDone)
+		if gate {
+			cmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
+		}
+		cmd += " && " + shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "learn", "--prompt", filepath.Join(state.RunDir, "learn.prompt.md"), "--output", learnLog(state), "--done", state.LearnDone)
+		stages = append(stages, runStage{Name: "learn", Dir: state.RepoRoot, Cmd: cmd, Log: learnLog(state)})
+	}
+	if land {
+		cmd := shellJoin(self(), "wait-file", state.ImplementDone)
+		if gate {
+			cmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
+		}
+		if learn {
+			cmd += " && " + shellJoin(self(), "wait-file", state.LearnDone)
+		}
+		cmd += " && " + shellJoin(self(), "land", "--repo", state.WorktreePath, "--run-dir", state.RunDir)
+		stages = append(stages, runStage{Name: "land", Dir: state.WorktreePath, Cmd: cmd, Log: landLog(state)})
+	}
+	return stages
+}
 
-	implementWin := prefix + "implement"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", implementWin, "-c", state.WorktreePath).Run(); err != nil {
-		return err
-	}
-	implementPane, err := tmuxPaneID(session + ":" + implementWin)
-	if err != nil {
-		return err
-	}
-	implementCmd := shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", "implementer", "--prompt", filepath.Join(state.RunDir, "implementer.prompt.md"), "--output", filepath.Join(state.RunDir, "implementer.log"), "--done", state.ImplementDone)
-	if err := tmuxSend(implementPane, implementCmd); err != nil {
-		return err
-	}
-
-	reviewWin := prefix + "review"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", reviewWin, "-c", state.WorktreePath).Run(); err != nil {
-		return err
-	}
-	reviewPane, err := tmuxPaneID(session + ":" + reviewWin)
-	if err != nil {
-		return err
-	}
-	for i, reviewer := range cfg.Agents.Reviewers {
-		if i > 0 {
-			reviewPane, err = tmuxSplitPane(session+":"+reviewWin, state.WorktreePath)
+// addRunWindows adds one run's windows to an existing tmux session. It is used
+// by the scriptable `sidekick run` path; console runs use launchHeadless.
+func addRunWindows(session, label string, cfg Config, state RunState, gate, learn, land bool) error {
+	stages := stageCommands(cfg, state, gate, learn, land)
+	for i, stage := range stages {
+		if i == 1 {
+			dashboardWin := stageWindowName(label, "dashboard")
+			if err := exec.Command("tmux", "new-window", "-t", session, "-n", dashboardWin, "-c", state.WorktreePath).Run(); err != nil {
+				return err
+			}
+			dashboardPane, err := tmuxPaneID(session + ":" + dashboardWin)
 			if err != nil {
 				return err
 			}
+			if err := tmuxSend(dashboardPane, shellJoin(self(), "status", "--run-dir", state.RunDir, "--watch")); err != nil {
+				return err
+			}
 		}
-		role := "reviewer-" + slug(reviewer.Name)
-		prompt := filepath.Join(state.RunDir, role+".prompt.md")
-		output := filepath.Join(state.RunDir, role+".log")
-		reviewerCmd := shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", role, "--prompt", prompt, "--output", output, "--done", reviewerDone(state, reviewer.Name))
-		if err := tmuxSend(reviewPane, reviewerCmd); err != nil {
-			return err
+		win := stageWindowName(label, stage.Name)
+		if err := exec.Command("tmux", "new-window", "-t", session, "-n", win, "-c", stage.Dir).Run(); err != nil {
+			return fmt.Errorf("create %s window: %w", stage.Name, err)
 		}
-	}
-	if len(cfg.Agents.Reviewers) > 1 {
-		_ = exec.Command("tmux", "select-layout", "-t", session+":"+reviewWin, "tiled").Run()
-	}
-
-	if gate {
-		gateWin := prefix + "gate"
-		if err := exec.Command("tmux", "new-window", "-t", session, "-n", gateWin, "-c", state.WorktreePath).Run(); err != nil {
-			return err
-		}
-		gatePane, err := tmuxPaneID(session + ":" + gateWin)
+		pane, err := tmuxPaneID(session + ":" + win)
 		if err != nil {
 			return err
 		}
-		gateCmd := shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "gate", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--output", gateLog(state), "--done", gateDone(state))
-		if err := tmuxSend(gatePane, gateCmd); err != nil {
+		if err := tmuxSend(pane, stage.Cmd); err != nil {
 			return err
 		}
 	}
-
-	if learn {
-		learnWin := prefix + "learn"
-		if err := exec.Command("tmux", "new-window", "-t", session, "-n", learnWin, "-c", state.RepoRoot).Run(); err != nil {
-			return err
-		}
-		learnPane, err := tmuxPaneID(session + ":" + learnWin)
-		if err != nil {
-			return err
-		}
-		learnCmd := shellJoin(self(), "wait-file", state.ImplementDone)
-		if gate {
-			learnCmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
-		}
-		learnCmd += " && " + shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "learn", "--prompt", filepath.Join(state.RunDir, "learn.prompt.md"), "--output", learnLog(state), "--done", state.LearnDone)
-		if err := tmuxSend(learnPane, learnCmd); err != nil {
-			return err
-		}
-	}
-
-	if land {
-		landWin := prefix + "land"
-		if err := exec.Command("tmux", "new-window", "-t", session, "-n", landWin, "-c", state.WorktreePath).Run(); err != nil {
-			return err
-		}
-		landPane, err := tmuxPaneID(session + ":" + landWin)
-		if err != nil {
-			return err
-		}
-		// wait for implementation, the gate, and repo learning before landing
-		landCmd := shellJoin(self(), "wait-file", state.ImplementDone)
-		if gate {
-			landCmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
-		}
-		if learn {
-			landCmd += " && " + shellJoin(self(), "wait-file", state.LearnDone)
-		}
-		landCmd += " && " + shellJoin(self(), "land", "--repo", state.WorktreePath, "--run-dir", state.RunDir)
-		if err := tmuxSend(landPane, landCmd); err != nil {
-			return err
-		}
-	}
-
 	return nil
+}
+
+func launchHeadless(session string, stages []runStage, state RunState) error {
+	for _, stage := range stages {
+		if stage.Interactive {
+			win := stageWindowName(state.ConsoleLabel, stage.Name)
+			if err := exec.Command("tmux", "new-window", "-t", session, "-n", win, "-c", stage.Dir).Run(); err != nil {
+				return fmt.Errorf("create %s window: %w", stage.Name, err)
+			}
+			pane, err := tmuxPaneID(session + ":" + win)
+			if err != nil {
+				return err
+			}
+			if err := tmuxSend(pane, stage.Cmd); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := launchDetached(stage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func launchDetached(stage runStage) error {
+	cmdText := stage.Cmd
+	if stage.Name == "land" && stage.Log != "" {
+		cmdText += " > " + shellQuote(stage.Log) + " 2>&1"
+	}
+	args := []string{"sh", "-c", cmdText}
+	if _, err := exec.LookPath("setsid"); err == nil {
+		args = append([]string{"setsid"}, args...)
+	}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = stage.Dir
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return err
+	}
+	cmd.Stdin = devNull
+	if err := cmd.Start(); err != nil {
+		_ = devNull.Close()
+		return err
+	}
+	_ = devNull.Close()
+	return nil
+}
+
+func stageWindowName(label, name string) string {
+	if label == "" {
+		return name
+	}
+	return label + "-" + name
 }
 
 // newBootstrapSession creates a new detached tmux session with a throwaway
@@ -1729,7 +2264,7 @@ func newBootstrapSession(session, root string) (string, error) {
 // spawnRun leases a worktree, writes run files and state, and adds the run's
 // windows to an existing tmux session under the given window-name prefix. It
 // does not create the session and does not attach; the caller decides that.
-func spawnRun(session, prefix, root string, cfg Config, task string, gate, learn, land bool) (RunState, error) {
+func spawnRun(session, label, root string, cfg Config, task string, gate, learn, land, headless bool) (RunState, error) {
 	runID, runDir, err := uniqueRunDir(root, task)
 	if err != nil {
 		return RunState{}, err
@@ -1753,6 +2288,7 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, learn
 
 	state := RunState{
 		ID:              runID,
+		ConsoleLabel:    label,
 		CreatedAt:       time.Now(),
 		RepoRoot:        root,
 		RunDir:          runDir,
@@ -1767,6 +2303,7 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, learn
 		TmuxSession:     session,
 		GateEnabled:     gate,
 		LearnEnabled:    learn,
+		LandEnabled:     land,
 		PlannerName:     plannerAgent.Name,
 		ImplementerName: implementerAgent.Name,
 		LearnerName:     learnerAgent.Name,
@@ -1781,8 +2318,15 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, learn
 	if err := writeState(state); err != nil {
 		return RunState{}, err
 	}
-	if err := addRunWindows(session, prefix, cfg, state, gate, learn, land); err != nil {
-		return RunState{}, err
+	stages := stageCommands(cfg, state, gate, learn, land)
+	if headless {
+		if err := launchHeadless(session, stages, state); err != nil {
+			return RunState{}, err
+		}
+	} else {
+		if err := addRunWindows(session, label, cfg, state, gate, learn, land); err != nil {
+			return RunState{}, err
+		}
 	}
 	return state, nil
 }
