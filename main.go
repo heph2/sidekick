@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,9 +24,10 @@ const (
 )
 
 type Config struct {
-	Agents AgentsConfig `json:"agents"`
-	Gate   GateConfig   `json:"gate"`
-	Notify NotifyConfig `json:"notify"`
+	Agents          AgentsConfig `json:"agents"`
+	Gate            GateConfig   `json:"gate"`
+	Notify          NotifyConfig `json:"notify"`
+	MaxReviewCycles int          `json:"maxReviewCycles,omitempty"`
 }
 
 type NotifyConfig struct {
@@ -114,6 +116,8 @@ func run(args []string) error {
 		return showStatus(args[2:])
 	case "agent":
 		return runAgent(args[2:])
+	case "cycle":
+		return runCycle(args[2:])
 	case "gate":
 		return runGate(args[2:])
 	case "wait-file":
@@ -159,6 +163,7 @@ Usage:
   sidekick init [--repo PATH]
   sidekick wizard [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
+  sidekick cycle --repo PATH --run-dir PATH
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
   sidekick land --repo PATH --run-dir PATH
   sidekick ship [--repo PATH] [--run-dir PATH]      # approve landing
@@ -174,6 +179,8 @@ Typical flow:
 
 No config or treehouse setup is required: sidekick uses built-in defaults and
 falls back to a plain git worktree when treehouse is unavailable.
+Set maxReviewCycles in .sidekick/config.json to cap implement/review loops
+(default: 3).
 `
 }
 
@@ -798,7 +805,7 @@ func handleConsoleCommand(input consoleInput, root, session string, runs map[str
 		if err != nil {
 			return err
 		}
-		return renderStatus(os.Stdout, state.RunDir, terminalWidth())
+		return renderStatus(os.Stdout, state.RunDir, terminalWidth(), 0)
 	case "attach":
 		if len(input.Args) != 2 {
 			return errors.New("usage: /attach <tN> <stage>")
@@ -890,7 +897,7 @@ func attachConsoleLog(session string, state RunState, stage string) error {
 func logForStage(state RunState, stage string) (string, error) {
 	stage = strings.TrimSpace(strings.ToLower(stage))
 	switch stage {
-	case "implement", "implementer":
+	case "cycle", "implement", "implementer":
 		return implementerLog(state), nil
 	case "gate":
 		return gateLog(state), nil
@@ -1022,7 +1029,7 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	agent, err := agentForRole(cfg, *role)
+	agent, err := agentForRunRole(cfg, state, *role)
 	if err != nil {
 		return err
 	}
@@ -1077,6 +1084,203 @@ func runAgent(args []string) error {
 		}
 	}
 	return nil
+}
+
+// runCycle owns the implement -> review -> fix loop for one run. It runs the
+// implementer, then all reviewers concurrently, and repeats with reviewer
+// feedback until every reviewer approves or maxReviewCycles is reached. It
+// writes implement.done on success and implement.done.failed on cap, so the
+// downstream gate/learn/land stages gate on the same marker they always have.
+func runCycle(args []string) error {
+	fs := flag.NewFlagSet("cycle", flag.ContinueOnError)
+	repo := fs.String("repo", "", "real repository root, used for config")
+	runDir := fs.String("run-dir", "", "run directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *repo == "" || *runDir == "" {
+		return errors.New("--repo and --run-dir are required")
+	}
+
+	root, err := repoRoot(*repo)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	state, err := loadState(*runDir)
+	if err != nil {
+		return err
+	}
+	if len(state.ReviewerNames) == 0 {
+		return errors.New("at least one reviewer is required")
+	}
+	if state.RepoRoot == "" {
+		state.RepoRoot = root
+	}
+
+	implementer := agentConfigByName(cfg.AllAgents(), state.ImplementerName, cfg.Agents.Implementer)
+	max := cfg.MaxReviewCycles
+	feedbackPath := filepath.Join(state.RunDir, "review-feedback.md")
+
+	for iter := 1; iter <= max; iter++ {
+		writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: implementing", iter, max))
+		prompt := implementerPrompt(state, implementer)
+		if iter > 1 {
+			prompt += fmt.Sprintf(`
+
+## Reviewer feedback (previous round)
+
+Reviewers requested changes in the previous round. Read:
+%s
+
+Address every concrete point before summarizing your validation.
+`, feedbackPath)
+		}
+		implementPromptPath := filepath.Join(state.RunDir, "implementer.prompt.md")
+		if err := os.WriteFile(implementPromptPath, []byte(prompt), 0o644); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return err
+		}
+		if err := runSidekickAgent(state, root, "implementer", implementPromptPath, implementerLog(state)); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return fmt.Errorf("implementer cycle %d/%d: %w", iter, max, err)
+		}
+
+		writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: reviewing", iter, max))
+		results := runReviewers(state, root)
+		needsRevision := false
+		for _, result := range results {
+			if result.Verdict == "revise" {
+				needsRevision = true
+				break
+			}
+		}
+		if !needsRevision {
+			for _, reviewer := range state.ReviewerNames {
+				if err := markFile(reviewerDone(state, reviewer)); err != nil {
+					_ = markFile(state.ImplementDone + ".failed")
+					return err
+				}
+			}
+			_ = os.Remove(feedbackPath)
+			writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: approved", iter, max))
+			return markFile(state.ImplementDone)
+		}
+		if err := writeReviewFeedback(feedbackPath, results); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return err
+		}
+	}
+
+	writeCycleStatus(state, fmt.Sprintf("cycle cap %d reached; review still requests changes", max))
+	_ = markFile(state.ImplementDone + ".failed")
+	return fmt.Errorf("review cycle cap %d reached with unresolved reviewer feedback", max)
+}
+
+type reviewResult struct {
+	Name    string
+	LogPath string
+	Verdict string
+	Err     error
+}
+
+// runSidekickAgent runs one agent stage synchronously without a done marker;
+// the cycle loop owns done markers so a per-round agent run never releases the
+// pipeline on its own.
+func runSidekickAgent(state RunState, repo, role, promptPath, outputPath string) error {
+	cmd := exec.Command(self(), "agent", "--repo", repo, "--run-dir", state.RunDir, "--role", role, "--prompt", promptPath, "--output", outputPath)
+	cmd.Dir = state.WorktreePath
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runReviewers(state RunState, repo string) []reviewResult {
+	results := make([]reviewResult, len(state.ReviewerNames))
+	var wg sync.WaitGroup
+	for i, reviewer := range state.ReviewerNames {
+		i, reviewer := i, reviewer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			role := "reviewer-" + slug(reviewer)
+			promptPath := filepath.Join(state.RunDir, role+".prompt.md")
+			logPath := reviewerLog(state, reviewer)
+			err := runSidekickAgent(state, repo, role, promptPath, logPath)
+			results[i] = reviewResult{
+				Name:    reviewer,
+				LogPath: logPath,
+				Verdict: reviewVerdict(logPath, err),
+				Err:     err,
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func reviewVerdict(logPath string, processErr error) string {
+	if processErr != nil {
+		return "revise"
+	}
+	return parseVerdict(logPath)
+}
+
+var verdictLineRE = regexp.MustCompile(`(?i)^\s*SIDEKICK_VERDICT:\s*([a-z-]+)`)
+
+func parseVerdict(logPath string) string {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return "approve"
+	}
+	defer file.Close()
+
+	last := ""
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		match := verdictLineRE.FindStringSubmatch(scanner.Text())
+		if len(match) == 2 {
+			last = strings.ToLower(match[1])
+		}
+	}
+	switch last {
+	case "approve", "approved", "lgtm":
+		return "approve"
+	case "revise", "request-changes", "changes":
+		return "revise"
+	default:
+		return "approve"
+	}
+}
+
+func writeReviewFeedback(path string, results []reviewResult) error {
+	var b strings.Builder
+	b.WriteString("# Reviewer feedback\n\n")
+	for _, result := range results {
+		if result.Verdict != "revise" {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n\n", result.Name)
+		if result.Err != nil {
+			fmt.Fprintf(&b, "Reviewer process failed: %v\n\n", result.Err)
+		}
+		data, err := os.ReadFile(result.LogPath)
+		if err != nil {
+			fmt.Fprintf(&b, "Could not read reviewer log %s: %v\n\n", result.LogPath, err)
+			continue
+		}
+		b.Write(bytes.TrimSpace(data))
+		b.WriteString("\n\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeCycleStatus(state RunState, msg string) {
+	fmt.Println(msg)
+	_ = os.WriteFile(filepath.Join(state.RunDir, "cycle.status"), []byte(msg+"\n"), 0o644)
 }
 
 // runInteractiveAgent attaches the harness to the pane's TTY (a live chat, no
@@ -1266,6 +1470,9 @@ func loadConfig(root string) (Config, error) {
 
 func (cfg Config) withDefaults() Config {
 	def := defaultConfig()
+	if cfg.MaxReviewCycles <= 0 {
+		cfg.MaxReviewCycles = 3
+	}
 	if cfg.Agents.Planner.Name == "" {
 		cfg.Agents.Planner = def.Agents.Planner
 	}
@@ -1319,19 +1526,41 @@ func selectAgent(agents []AgentConfig, fallback, name string) (AgentConfig, erro
 }
 
 func agentForRole(cfg Config, role string) (AgentConfig, error) {
+	return agentForRunRole(cfg, RunState{}, role)
+}
+
+// agentForRunRole resolves the agent for a role, preferring the specific agent
+// the run recorded (planner/implementer/learner/reviewer names in state) over
+// the config default, so a run that selected a non-default agent keeps using it.
+func agentForRunRole(cfg Config, state RunState, role string) (AgentConfig, error) {
 	role = strings.TrimSpace(role)
 	if role == "planner" {
+		if state.PlannerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.PlannerName, cfg.Agents.Planner)), nil
+		}
 		return normalizeAgent(cfg.Agents.Planner), nil
 	}
 	if role == "implementer" {
+		if state.ImplementerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.ImplementerName, cfg.Agents.Implementer)), nil
+		}
 		return normalizeAgent(cfg.Agents.Implementer), nil
 	}
 	if role == "learn" {
+		if state.LearnerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.LearnerName, cfg.Agents.Learner)), nil
+		}
 		return normalizeAgent(cfg.Agents.Learner), nil
 	}
-	for _, reviewer := range cfg.Agents.Reviewers {
-		if role == "reviewer-"+slug(reviewer.Name) {
-			return normalizeAgent(reviewer), nil
+	reviewerNames := state.ReviewerNames
+	if len(reviewerNames) == 0 {
+		for _, reviewer := range cfg.Agents.Reviewers {
+			reviewerNames = append(reviewerNames, reviewer.Name)
+		}
+	}
+	for _, reviewerName := range reviewerNames {
+		if role == "reviewer-"+slug(reviewerName) {
+			return normalizeAgent(agentConfigByName(cfg.Agents.Reviewers, reviewerName, AgentConfig{Name: reviewerName})), nil
 		}
 	}
 	return AgentConfig{}, fmt.Errorf("unknown role %q", role)
@@ -1772,6 +2001,7 @@ type StatusView struct {
 	State       RunState
 	Goal        string
 	Phase       string
+	Cycle       string
 	Elapsed     time.Duration
 	Steps       []PipelineStep
 	RecentTitle string
@@ -1795,6 +2025,9 @@ func renderStatus(w io.Writer, runDir string, width int, frame int) error {
 	fmt.Fprintf(w, "%s %s  %s  %s\n", spinnerGlyph(view.Phase, frame), col("1", "Sidekick"), col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
 	fmt.Fprintf(w, "%s\n", strings.Repeat("=", width))
 	fmt.Fprintf(w, "Run:  %s\n", view.State.ID)
+	if view.Cycle != "" {
+		fmt.Fprintf(w, "Cycle: %s\n", view.Cycle)
+	}
 	fmt.Fprintf(w, "Goal: %s\n", col("1", clip(view.Goal, width-6)))
 	fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", width))
 
@@ -1919,14 +2152,18 @@ func buildStatusView(runDir string) (StatusView, error) {
 	view := StatusView{
 		State:   state,
 		Goal:    firstLine(state.TaskFile),
+		Cycle:   readLine(filepath.Join(state.RunDir, "cycle.status")),
 		Elapsed: time.Since(state.CreatedAt),
 	}
 	view.Steps = append(view.Steps, PipelineStep{Name: "planner", Status: stepStatus(state.PlannerDone, state.PlanFile), Log: state.PlanFile})
 	view.Steps = append(view.Steps, PipelineStep{Name: "implementer", Status: stepStatus(state.ImplementDone, implementerLog(state)), Log: implementerLog(state)})
+	// The cycle stage runs implement and review together, so reviewer logs
+	// appear before implement.done exists. Gate the review rows on planner.done
+	// (the cycle's real prerequisite) rather than implement.done.
 	for _, reviewer := range state.ReviewerNames {
 		log := reviewerLog(state, reviewer)
 		done := reviewerDone(state, reviewer)
-		view.Steps = append(view.Steps, PipelineStep{Name: "review " + reviewer, Status: gatedStepStatus(state.ImplementDone, done, log), Log: log})
+		view.Steps = append(view.Steps, PipelineStep{Name: "review " + reviewer, Status: gatedStepStatus(state.PlannerDone, done, log), Log: log})
 	}
 	if state.GateEnabled {
 		log := gateLog(state)
@@ -2112,6 +2349,20 @@ func firstLine(path string) string {
 		}
 	}
 	return "empty task"
+}
+
+func readLine(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func lastLines(path string, count int) []string {
@@ -2369,21 +2620,14 @@ func stageCommands(cfg Config, state RunState, gate, learn, land bool) []runStag
 			Interactive: true,
 		},
 		{
-			Name: "implement",
+			// The cycle stage owns the implement -> review -> fix loop and writes
+			// implement.done (or .failed) when it converges, so gate/learn/land
+			// still key off the same marker.
+			Name: "cycle",
 			Dir:  state.WorktreePath,
-			Cmd:  shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", "implementer", "--prompt", filepath.Join(state.RunDir, "implementer.prompt.md"), "--output", implementerLog(state), "--done", state.ImplementDone),
+			Cmd:  shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "cycle", "--repo", state.RepoRoot, "--run-dir", state.RunDir),
 			Log:  implementerLog(state),
 		},
-	}
-	for _, reviewer := range cfg.Agents.Reviewers {
-		role := "reviewer-" + slug(reviewer.Name)
-		output := reviewerLog(state, reviewer.Name)
-		stages = append(stages, runStage{
-			Name: "review-" + slug(reviewer.Name),
-			Dir:  state.WorktreePath,
-			Cmd:  shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", role, "--prompt", filepath.Join(state.RunDir, role+".prompt.md"), "--output", output, "--done", reviewerDone(state, reviewer.Name)),
-			Log:  output,
-		})
 	}
 	if gate {
 		stages = append(stages, runStage{
@@ -2779,6 +3023,11 @@ Required output:
 - Then a brief conclusion.
 
 Do not edit files during review.
+
+End with exactly one line and nothing after it:
+SIDEKICK_VERDICT: approve
+or
+SIDEKICK_VERDICT: revise
 `, agent.Name, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath, state.MemoryFile)
 }
 

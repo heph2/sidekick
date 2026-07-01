@@ -186,6 +186,9 @@ func TestConfigDefaults(t *testing.T) {
 	if !reflect.DeepEqual(cfg.Gate.Command, []string{"no-mistakes", "-y"}) {
 		t.Fatalf("gate command = %#v", cfg.Gate.Command)
 	}
+	if cfg.MaxReviewCycles != 3 {
+		t.Fatalf("max review cycles = %d, want 3", cfg.MaxReviewCycles)
+	}
 }
 
 func TestPresetAgent(t *testing.T) {
@@ -231,6 +234,21 @@ func TestAgentForRoleLearner(t *testing.T) {
 	}
 }
 
+func TestAgentForRunRoleUsesStateSelection(t *testing.T) {
+	cfg := (Config{}).withDefaults()
+	custom := AgentConfig{Name: "custom-implementer", Command: []string{"custom"}, PromptMode: "stdin"}
+	cfg.Agents.Reviewers = append(cfg.Agents.Reviewers, custom)
+	state := RunState{ImplementerName: custom.Name}
+
+	agent, err := agentForRunRole(cfg, state, "implementer")
+	if err != nil {
+		t.Fatalf("agentForRunRole() error = %v", err)
+	}
+	if agent.Name != custom.Name {
+		t.Fatalf("agent = %q, want %q", agent.Name, custom.Name)
+	}
+}
+
 func TestBuildStatusViewWaiting(t *testing.T) {
 	state := testRunState(t, false)
 	view, err := buildStatusView(state.RunDir)
@@ -253,11 +271,15 @@ func TestBuildStatusViewRunningAndComplete(t *testing.T) {
 	state := testRunState(t, true)
 	mustWrite(t, state.PlanFile, "Plan\n")
 	mustWrite(t, state.PlannerDone, "done\n")
+	mustWrite(t, filepath.Join(state.RunDir, "cycle.status"), "cycle 1/3: implementing\n")
 	mustWrite(t, implementerLog(state), "working\n")
 
 	view, err := buildStatusView(state.RunDir)
 	if err != nil {
 		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if view.Cycle != "cycle 1/3: implementing" {
+		t.Fatalf("cycle = %q, want cycle status", view.Cycle)
 	}
 	if view.Phase != "implementer" {
 		t.Fatalf("phase = %q, want implementer", view.Phase)
@@ -294,6 +316,57 @@ func TestBuildStatusViewRunningAndComplete(t *testing.T) {
 	wantStatuses = []string{"done", "done", "done", "done"}
 	if got := stepStatuses(view.Steps); !reflect.DeepEqual(got, wantStatuses) {
 		t.Fatalf("statuses = %#v, want %#v", got, wantStatuses)
+	}
+}
+
+func TestBuildStatusViewReviewerCanRunBeforeImplementDone(t *testing.T) {
+	state := testRunState(t, false)
+	mustWrite(t, state.PlanFile, "Plan\n")
+	mustWrite(t, state.PlannerDone, "done\n")
+	mustWrite(t, reviewerLog(state, "codex-reviewer"), "reviewing\n")
+
+	view, err := buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "review codex-reviewer"); got != "running" {
+		t.Fatalf("reviewer status = %q, want running", got)
+	}
+}
+
+func TestParseVerdict(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "approve", body: "looks good\nSIDEKICK_VERDICT: approve\n", want: "approve"},
+		{name: "revise", body: "fix it\nSIDEKICK_VERDICT: revise\n", want: "revise"},
+		{name: "last wins", body: "SIDEKICK_VERDICT: revise\nlater\nSIDEKICK_VERDICT: approve\n", want: "approve"},
+		{name: "unknown approves", body: "SIDEKICK_VERDICT: maybe\n", want: "approve"},
+		{name: "no verdict approves", body: "no machine line\n", want: "approve"},
+		{name: "case insensitive", body: "  sidekick_verdict: REQUEST-CHANGES\n", want: "revise"},
+		{name: "aliases", body: "SIDEKICK_VERDICT: lgtm\n", want: "approve"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, slug(tc.name)+".log")
+			mustWrite(t, path, tc.body)
+			if got := parseVerdict(path); got != tc.want {
+				t.Fatalf("parseVerdict() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	if got := parseVerdict(filepath.Join(dir, "missing.log")); got != "approve" {
+		t.Fatalf("missing verdict = %q, want approve", got)
+	}
+}
+
+func TestReviewVerdictProcessErrorForcesRevise(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "review.log")
+	mustWrite(t, path, "SIDEKICK_VERDICT: approve\n")
+	if got := reviewVerdict(path, exec.ErrNotFound); got != "revise" {
+		t.Fatalf("reviewVerdict(process error) = %q, want revise", got)
 	}
 }
 
@@ -617,7 +690,7 @@ func TestStageCommands(t *testing.T) {
 		names = append(names, stage.Name)
 		interactive[stage.Name] = stage.Interactive
 	}
-	want := []string{"planner", "implement", "review-codex-reviewer", "review-claude-reviewer", "gate", "learn", "land"}
+	want := []string{"planner", "cycle", "gate", "learn", "land"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("stage names = %#v, want %#v", names, want)
 	}
@@ -635,7 +708,7 @@ func TestStageCommands(t *testing.T) {
 	for _, stage := range stages {
 		names = append(names, stage.Name)
 	}
-	want = []string{"planner", "implement", "review-codex-reviewer", "review-claude-reviewer"}
+	want = []string{"planner", "cycle"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("minimal stage names = %#v, want %#v", names, want)
 	}

@@ -6,7 +6,7 @@ It keeps the human in one conversation while coordinating the noisy parts:
 
 - planning with a dedicated AI harness
 - implementation in an isolated worktree (Treehouse when available, otherwise a plain git worktree)
-- review by multiple harnesses
+- review by multiple harnesses, looping back into implementation when changes are requested
 - optional `no-mistakes` gating after implementation
 - repo-local memory that records what happened and durable lessons for future runs
 - one tmux workspace with a fixed live dashboard for visibility without constant pane switching
@@ -21,9 +21,12 @@ The default console flow is:
    it writes `.sidekick/runs/<id>/plan.md`, and Sidekick asks you to release the
    implementer before anything else starts
 2. release or abort from the console with `/release [tN]` or `/abort [tN]`
-3. implementer waits for your approval, then works headlessly in an isolated worktree
-4. reviewers wait for implementation to finish, then review the git diff headlessly
-5. learner waits for implementation, then updates `.sidekick/memory.md` with a
+3. `sidekick cycle` waits for your approval, then works headlessly in an isolated
+   worktree: it runs the implementer, then runs reviewers against the result
+4. if any reviewer requests changes, Sidekick writes reviewer feedback and
+   reruns the implementer; the loop repeats until all reviewers approve or
+   `maxReviewCycles` is reached
+5. learner waits for implementation approval, then updates `.sidekick/memory.md` with a
    run entry and concise repo insights (skip with `--no-learn`)
 6. the shared dashboard window tracks every console run, its phase, pipeline
    status, and recent output (with color on a TTY)
@@ -153,7 +156,8 @@ Default config:
   "notify": {
     "noBell": false,
     "command": []
-  }
+  },
+  "maxReviewCycles": 3
 }
 ```
 
@@ -196,6 +200,10 @@ real repo root, reads the run files and worktree diff, and updates only
 `.sidekick/memory.md`. Planner, implementer, and reviewer prompts tell agents to
 read that file first when it exists, so durable repo conventions and pitfalls are
 carried into future runs. Use `--no-learn` to skip this for a run.
+
+`maxReviewCycles` caps the implement/review loop. When the cap is reached while
+any reviewer still requests changes, Sidekick marks implementation failed so
+gate, learner, and land do not proceed.
 
 `notify` controls attention signals. The terminal bell is enabled by default;
 set `"noBell": true` to silence it. `notify.command` is optional and receives
