@@ -24,6 +24,9 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 
 - Keep changes small and compatible with configurable agent harnesses.
 - Do not hard-code `claude`, `cc`, `codex`, Treehouse, or `no-mistakes` flags beyond defaults; use `.sidekick/config.json` for local harness details.
+- Agent configs may set `model` as sugar for appending `--model <value>` before the prompt; use per-agent `modelFlag` when a harness needs a different flag, or keep complex cases in `command`.
+- Agent configs may set `prompt` to override planner, implementer, or reviewer initial prompts; Sidekick expands `$SIDEKICK_*` run variables.
+- `notify` config uses terminal bell by default and may run a user-supplied `notify.command`; desktop notification commands are not auto-detected.
 - Do not commit generated binaries such as `bin/sidekick`.
 - Preserve ASCII-only source files unless a change explicitly requires otherwise.
 - Run `gofmt -w` on Go files, then `go test ./...` and `go build -o bin/sidekick .`.

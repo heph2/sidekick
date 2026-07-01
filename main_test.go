@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,6 +61,90 @@ func TestCommandForAgentPromptModes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(fileCmd.Args, []string{"agent", "--model", "plan", "prompt.md"}) {
 		t.Fatalf("file args = %#v", fileCmd.Args)
+	}
+}
+
+func TestCommandForAgentModel(t *testing.T) {
+	agent := AgentConfig{Name: "planner", Command: []string{"agent", "exec"}, PromptMode: "arg", Model: "opus"}
+	cmd, err := commandForAgent(agent, "prompt text", "prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"agent", "exec", "--model", "opus", "prompt text"}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("args = %#v, want %#v", cmd.Args, want)
+	}
+
+	agent.ModelFlag = "--model-id"
+	cmd, err = commandForAgent(agent, "prompt text", "prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"agent", "exec", "--model-id", "opus", "prompt text"}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("custom flag args = %#v, want %#v", cmd.Args, want)
+	}
+
+	agent.Model = ""
+	cmd, err = commandForAgent(agent, "prompt text", "prompt.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"agent", "exec", "prompt text"}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("empty model args = %#v, want %#v", cmd.Args, want)
+	}
+}
+
+func TestExpandPrompt(t *testing.T) {
+	state := RunState{
+		ID:           "run-1",
+		RunDir:       "/runs/run-1",
+		TaskFile:     "/runs/run-1/task.md",
+		PlanFile:     "/runs/run-1/plan.md",
+		WorktreePath: "/worktrees/run-1",
+	}
+	got := expandPrompt("$SIDEKICK_RUN_ID|$SIDEKICK_RUN_DIR|$SIDEKICK_TASK_FILE|$SIDEKICK_PLAN_FILE|$SIDEKICK_WORKTREE|$UNKNOWN", state)
+	want := "run-1|/runs/run-1|/runs/run-1/task.md|/runs/run-1/plan.md|/worktrees/run-1|"
+	if got != want {
+		t.Fatalf("expandPrompt() = %q, want %q", got, want)
+	}
+}
+
+func TestPromptOverrides(t *testing.T) {
+	state := testRunState(t, false)
+
+	planner := plannerPrompt(state, AgentConfig{Prompt: "plan $SIDEKICK_RUN_ID from $SIDEKICK_TASK_FILE"})
+	if planner != "plan test-run from "+state.TaskFile {
+		t.Fatalf("planner override = %q", planner)
+	}
+
+	implementerDefault := implementerPrompt(state, AgentConfig{})
+	if !strings.Contains(implementerDefault, "Sidekick implementation task") {
+		t.Fatalf("implementer default missing built-in prompt:\n%s", implementerDefault)
+	}
+
+	reviewer := reviewerPrompt(state, AgentConfig{Name: "custom-reviewer", Prompt: "review $SIDEKICK_WORKTREE"})
+	if reviewer != "review "+state.WorktreePath {
+		t.Fatalf("reviewer override = %q", reviewer)
+	}
+}
+
+func TestNotifyConfigJSON(t *testing.T) {
+	var cfg Config
+	if err := json.Unmarshal([]byte(`{"notify":{"noBell":true,"command":["notify-send","Sidekick"]}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Notify.NoBell {
+		t.Fatal("NoBell = false, want true")
+	}
+	if !reflect.DeepEqual(cfg.Notify.Command, []string{"notify-send", "Sidekick"}) {
+		t.Fatalf("notify command = %#v", cfg.Notify.Command)
+	}
+
+	cfg = (Config{}).withDefaults()
+	if cfg.Notify.NoBell {
+		t.Fatal("omitted notify disabled bell; want bell enabled by default")
 	}
 }
 

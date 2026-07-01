@@ -25,6 +25,15 @@ const (
 type Config struct {
 	Agents AgentsConfig `json:"agents"`
 	Gate   GateConfig   `json:"gate"`
+	Notify NotifyConfig `json:"notify"`
+}
+
+type NotifyConfig struct {
+	// NoBell silences the terminal bell. By default the bell is enabled.
+	NoBell bool `json:"noBell,omitempty"`
+	// Command is an optional notifier command. The message is appended as the
+	// final argument, for example ["notify-send", "Sidekick"].
+	Command []string `json:"command,omitempty"`
 }
 
 type AgentsConfig struct {
@@ -37,6 +46,14 @@ type AgentConfig struct {
 	Name       string   `json:"name"`
 	Command    []string `json:"command"`
 	PromptMode string   `json:"promptMode"`
+	// Model is appended as <ModelFlag> <value> when set. Empty uses the
+	// harness default or any model already supplied in Command.
+	Model string `json:"model,omitempty"`
+	// ModelFlag is the flag used to pass Model. Defaults to "--model".
+	ModelFlag string `json:"modelFlag,omitempty"`
+	// Prompt overrides the built-in initial prompt. $SIDEKICK_* run variables
+	// are expanded when run files are written.
+	Prompt string `json:"prompt,omitempty"`
 	// Interactive runs the harness attached to the pane's TTY (a live chat)
 	// and gates the pipeline on human approval instead of capturing output.
 	Interactive bool `json:"interactive,omitempty"`
@@ -264,7 +281,7 @@ func startRun(args []string) error {
 		state.ReviewerNames = append(state.ReviewerNames, reviewer.Name)
 	}
 
-	if err := writeRunFiles(state, taskText); err != nil {
+	if err := writeRunFiles(state, taskText, cfg); err != nil {
 		return err
 	}
 	if err := writeState(state); err != nil {
@@ -317,11 +334,33 @@ func showStatus(args []string) error {
 	}
 
 	if *watch {
+		state, err := loadState(*runDir)
+		if err != nil {
+			return err
+		}
+		cfg, err := loadConfig(state.RepoRoot)
+		if err != nil {
+			return err
+		}
+		previousPhase := ""
 		for {
 			fmt.Print("\033[H\033[2J")
 			if err := renderStatus(os.Stdout, *runDir, terminalWidth()); err != nil {
 				return err
 			}
+			view, err := buildStatusView(*runDir)
+			if err != nil {
+				return err
+			}
+			if previousPhase != "" && view.Phase != previousPhase {
+				switch {
+				case view.Phase == "complete":
+					notify(cfg, "Sidekick: run complete")
+				case strings.HasPrefix(view.Phase, "failed:"):
+					notify(cfg, "Sidekick: "+view.Phase)
+				}
+			}
+			previousPhase = view.Phase
 			time.Sleep(*interval)
 		}
 	}
@@ -374,7 +413,7 @@ func runAgent(args []string) error {
 	)
 
 	if normalizeAgent(agent).Interactive {
-		return runInteractiveAgent(agent, prompt, *promptPath, workDirForRole(state, *role), env, *donePath)
+		return runInteractiveAgent(cfg, agent, prompt, *promptPath, workDirForRole(state, *role), env, *donePath)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(*outputPath), 0o755); err != nil {
@@ -414,7 +453,7 @@ func runAgent(args []string) error {
 // runInteractiveAgent attaches the harness to the pane's TTY (a live chat, no
 // output capture) so its native UI renders, then gates the pipeline on human
 // approval: only "y" releases downstream, anything else aborts it.
-func runInteractiveAgent(agent AgentConfig, prompt []byte, promptPath, dir string, env []string, donePath string) error {
+func runInteractiveAgent(cfg Config, agent AgentConfig, prompt []byte, promptPath, dir string, env []string, donePath string) error {
 	cmd, err := commandForAgent(agent, strings.TrimSpace(string(prompt)), promptPath)
 	if err != nil {
 		return err
@@ -433,6 +472,7 @@ func runInteractiveAgent(agent AgentConfig, prompt []byte, promptPath, dir strin
 	if donePath == "" {
 		return nil
 	}
+	notify(cfg, "Sidekick: plan ready, release implementer?")
 	if confirmRelease(os.Stdin, os.Stdout) {
 		return markFile(donePath)
 	}
@@ -784,6 +824,19 @@ func runQuiet(name string, args ...string) {
 	_ = exec.Command(name, args...).Run()
 }
 
+// notify signals that a run needs attention. It is best-effort: terminal bell by
+// default, plus an optional user-configured notifier command.
+func notify(cfg Config, msg string) {
+	if !cfg.Notify.NoBell {
+		fmt.Fprint(os.Stderr, "\a")
+	}
+	if len(cfg.Notify.Command) > 0 {
+		args := append([]string{}, cfg.Notify.Command[1:]...)
+		args = append(args, msg)
+		runQuiet(cfg.Notify.Command[0], args...)
+	}
+}
+
 // landRun commits the worktree, then (after a prompt) pushes its branch and
 // opens a PR. Commit is local and reversible; the push/PR is the outward action
 // and is gated behind an explicit yes.
@@ -820,6 +873,11 @@ func landRun(args []string) error {
 	}
 	fmt.Printf("committed on branch %s\n", branch)
 
+	cfg, err := loadConfig(state.RepoRoot)
+	if err != nil {
+		return err
+	}
+	notify(cfg, "Sidekick: ready to push "+branch+" and open a PR")
 	if !promptYesNo(os.Stdin, os.Stdout, fmt.Sprintf("Push %s and open a PR? [y/N] ", branch)) {
 		fmt.Printf("left local; push later with: git -C %s push -u origin %s\n", wt, branch)
 		return nil
@@ -865,14 +923,17 @@ func landCommit(wt, goal string) (string, bool, error) {
 	return strings.TrimSpace(string(branchOut)), true, nil
 }
 
-func writeRunFiles(state RunState, task string) error {
+func writeRunFiles(state RunState, task string, cfg Config) error {
+	planner := agentConfigByName(cfg.AllAgents(), state.PlannerName, cfg.Agents.Planner)
+	implementer := agentConfigByName(cfg.AllAgents(), state.ImplementerName, cfg.Agents.Implementer)
 	files := map[string]string{
 		state.TaskFile: task + "\n",
-		filepath.Join(state.RunDir, "planner.prompt.md"):     plannerPrompt(state),
-		filepath.Join(state.RunDir, "implementer.prompt.md"): implementerPrompt(state),
+		filepath.Join(state.RunDir, "planner.prompt.md"):     plannerPrompt(state, planner),
+		filepath.Join(state.RunDir, "implementer.prompt.md"): implementerPrompt(state, implementer),
 	}
 	for _, reviewer := range state.ReviewerNames {
-		files[filepath.Join(state.RunDir, "reviewer-"+slug(reviewer)+".prompt.md")] = reviewerPrompt(state, reviewer)
+		agent := agentConfigByName(cfg.Agents.Reviewers, reviewer, AgentConfig{Name: reviewer})
+		files[filepath.Join(state.RunDir, "reviewer-"+slug(reviewer)+".prompt.md")] = reviewerPrompt(state, agent)
 	}
 	if state.GateEnabled {
 		files[filepath.Join(state.RunDir, "gate.prompt.md")] = gatePrompt(state)
@@ -883,6 +944,15 @@ func writeRunFiles(state RunState, task string) error {
 		}
 	}
 	return nil
+}
+
+func agentConfigByName(agents []AgentConfig, name string, fallback AgentConfig) AgentConfig {
+	for _, agent := range agents {
+		if agent.Name == name {
+			return agent
+		}
+	}
+	return fallback
 }
 
 type PipelineStep struct {
@@ -1328,6 +1398,13 @@ func commandForAgent(agent AgentConfig, prompt, promptPath string) (*exec.Cmd, e
 		return nil, errors.New("empty agent command")
 	}
 	args := append([]string{}, agent.Command[1:]...)
+	if model := strings.TrimSpace(agent.Model); model != "" {
+		flag := strings.TrimSpace(agent.ModelFlag)
+		if flag == "" {
+			flag = "--model"
+		}
+		args = append(args, flag, model)
+	}
 	switch normalizeAgent(agent).PromptMode {
 	case "stdin":
 	case "arg":
@@ -1354,7 +1431,29 @@ func workDirForRole(state RunState, role string) string {
 	return state.WorktreePath
 }
 
-func plannerPrompt(state RunState) string {
+func expandPrompt(tmpl string, state RunState) string {
+	return os.Expand(tmpl, func(key string) string {
+		switch key {
+		case "SIDEKICK_RUN_ID":
+			return state.ID
+		case "SIDEKICK_RUN_DIR":
+			return state.RunDir
+		case "SIDEKICK_TASK_FILE":
+			return state.TaskFile
+		case "SIDEKICK_PLAN_FILE":
+			return state.PlanFile
+		case "SIDEKICK_WORKTREE":
+			return state.WorktreePath
+		default:
+			return ""
+		}
+	})
+}
+
+func plannerPrompt(state RunState, agent AgentConfig) string {
+	if strings.TrimSpace(agent.Prompt) != "" {
+		return expandPrompt(agent.Prompt, state)
+	}
 	return fmt.Sprintf(`# Sidekick planning task (interactive)
 
 You are the planning agent for Sidekick run %s. This is a back-and-forth chat
@@ -1381,7 +1480,10 @@ the implementer.
 `, state.ID, state.TaskFile, state.PlanFile)
 }
 
-func implementerPrompt(state RunState) string {
+func implementerPrompt(state RunState, agent AgentConfig) string {
+	if strings.TrimSpace(agent.Prompt) != "" {
+		return expandPrompt(agent.Prompt, state)
+	}
 	return fmt.Sprintf(`# Sidekick implementation task
 
 You are the implementation agent for Sidekick run %s.
@@ -1404,7 +1506,10 @@ Execute the plan with the smallest correct change. Keep the worktree reviewable:
 `, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath)
 }
 
-func reviewerPrompt(state RunState, reviewer string) string {
+func reviewerPrompt(state RunState, agent AgentConfig) string {
+	if strings.TrimSpace(agent.Prompt) != "" {
+		return expandPrompt(agent.Prompt, state)
+	}
 	return fmt.Sprintf(`# Sidekick review task
 
 You are %s reviewing Sidekick run %s.
@@ -1426,7 +1531,7 @@ Required output:
 - Then a brief conclusion.
 
 Do not edit files during review.
-`, reviewer, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath)
+`, agent.Name, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath)
 }
 
 func gatePrompt(state RunState) string {

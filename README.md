@@ -94,11 +94,12 @@ Default config:
     "planner": {
       "name": "claude-planner",
       "command": ["claude"],
-      "promptMode": "stdin"
+      "promptMode": "arg",
+      "interactive": true
     },
     "implementer": {
       "name": "codex-implementer",
-      "command": ["codex"],
+      "command": ["codex", "exec", "--sandbox", "workspace-write"],
       "promptMode": "stdin"
     },
     "reviewers": [
@@ -117,6 +118,10 @@ Default config:
   "gate": {
     "enabled": false,
     "command": ["no-mistakes", "-y"]
+  },
+  "notify": {
+    "noBell": false,
+    "command": []
   }
 }
 ```
@@ -134,6 +139,36 @@ Use `command` to add local model and approval flags, for example:
   "name": "cc-planner",
   "command": ["cc", "--model", "your-planning-model"],
   "promptMode": "stdin"
+}
+```
+
+Or set `model` on an agent. Sidekick appends `--model <value>` before the
+prompt by default; set `modelFlag` when a harness uses a different flag. If a
+harness needs more complex model selection, keep using `command` directly.
+
+```json
+{
+  "name": "codex-implementer",
+  "command": ["codex", "exec", "--sandbox", "workspace-write"],
+  "promptMode": "stdin",
+  "model": "gpt-5-codex"
+}
+```
+
+Each planner, implementer, or reviewer can also set `prompt` to replace the
+built-in initial prompt. Sidekick expands `$SIDEKICK_RUN_ID`,
+`$SIDEKICK_RUN_DIR`, `$SIDEKICK_TASK_FILE`, `$SIDEKICK_PLAN_FILE`, and
+`$SIDEKICK_WORKTREE` in custom prompts.
+
+`notify` controls attention signals. The terminal bell is enabled by default;
+set `"noBell": true` to silence it. `notify.command` is optional and receives
+the Sidekick message as its final argument, for example:
+
+```json
+{
+  "notify": {
+    "command": ["notify-send", "Sidekick"]
+  }
 }
 ```
 
