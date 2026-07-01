@@ -380,7 +380,8 @@ func runAgent(args []string) error {
 	)
 	cmd.Stdin = agentStdin(agent, prompt)
 	cmd.Stdout = io.MultiWriter(os.Stdout, out)
-	cmd.Stderr = os.Stderr
+	// tee stderr to the log too, else agent failures leave an empty log
+	cmd.Stderr = io.MultiWriter(os.Stderr, out)
 
 	if err := cmd.Run(); err != nil {
 		if *donePath != "" {
@@ -483,12 +484,14 @@ func defaultConfig() Config {
 				PromptMode: "stdin",
 			},
 			Implementer: AgentConfig{
+				// codex exec = non-interactive (bare `codex` is a TUI that rejects
+				// piped stdin); workspace-write lets it edit the worktree.
 				Name:       "codex-implementer",
-				Command:    []string{"codex"},
+				Command:    []string{"codex", "exec", "--sandbox", "workspace-write"},
 				PromptMode: "stdin",
 			},
 			Reviewers: []AgentConfig{
-				{Name: "codex-reviewer", Command: []string{"codex"}, PromptMode: "stdin"},
+				{Name: "codex-reviewer", Command: []string{"codex", "exec"}, PromptMode: "stdin"},
 				{Name: "claude-reviewer", Command: []string{"claude"}, PromptMode: "stdin"},
 			},
 		},
