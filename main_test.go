@@ -409,6 +409,47 @@ func TestConfirmRelease(t *testing.T) {
 	}
 }
 
+func TestFindWaitingRunAndRelease(t *testing.T) {
+	root := t.TempDir()
+	runs := filepath.Join(root, runRoot)
+	mk := func(name string, done bool) string {
+		dir := filepath.Join(runs, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, filepath.Join(dir, "state.json"), "{}")
+		if done {
+			mustWrite(t, filepath.Join(dir, "planner.done"), "x")
+		}
+		return dir
+	}
+	mk("20260101-000000-old", true) // already released
+	waiting := mk("20260202-000000-new", false)
+
+	got, err := findWaitingRun(root)
+	if err != nil {
+		t.Fatalf("findWaitingRun() error = %v", err)
+	}
+	if got != waiting {
+		t.Fatalf("findWaitingRun() = %q, want %q", got, waiting)
+	}
+
+	if err := signalPlanner([]string{"--run-dir", waiting}, false); err != nil {
+		t.Fatalf("release error = %v", err)
+	}
+	if !fileExists(filepath.Join(waiting, "planner.done")) {
+		t.Fatal("planner.done not written")
+	}
+	// releasing again must refuse to clobber
+	if err := signalPlanner([]string{"--run-dir", waiting}, false); err == nil {
+		t.Fatal("expected already-released error on second release")
+	}
+	// nothing left waiting
+	if _, err := findWaitingRun(root); err == nil {
+		t.Fatal("expected no-waiting-run error")
+	}
+}
+
 func TestLandCommit(t *testing.T) {
 	root := t.TempDir()
 	for _, args := range [][]string{

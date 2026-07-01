@@ -118,6 +118,10 @@ func run(args []string) error {
 		return cleanRuns(args[2:])
 	case "land":
 		return landRun(args[2:])
+	case "release":
+		return signalPlanner(args[2:], false)
+	case "abort":
+		return signalPlanner(args[2:], true)
 	case "help", "-h", "--help":
 		return usage()
 	default:
@@ -149,6 +153,8 @@ Usage:
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
   sidekick land --repo PATH --run-dir PATH
+  sidekick release [--repo PATH] [--run-dir PATH]   # approve the newest waiting plan
+  sidekick abort   [--repo PATH] [--run-dir PATH]   # cancel it instead
   sidekick wait-file FILE
   sidekick clean [--repo PATH] [--run ID]
 
@@ -615,16 +621,22 @@ func runInteractiveAgent(cfg Config, agent AgentConfig, prompt []byte, promptPat
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if donePath != "" {
-			_ = markFile(donePath + ".failed")
-		}
-		return err
-	}
+	runErr := cmd.Run()
 	if donePath == "" {
-		return nil
+		return runErr
+	}
+	// A `sidekick release`/`abort` from another pane may have already resolved
+	// this run; never clobber that decision (also means killing the planner
+	// window after releasing elsewhere won't spuriously mark it failed).
+	if fileExists(donePath) || fileExists(donePath+".failed") {
+		return runErr
+	}
+	if runErr != nil {
+		_ = markFile(donePath + ".failed")
+		return runErr
 	}
 	notify(cfg, "Sidekick: plan ready, release implementer?")
+	fmt.Fprintln(os.Stdout, "(or run `sidekick release` in another pane; `sidekick abort` to cancel)")
 	if confirmRelease(os.Stdin, os.Stdout) {
 		return markFile(donePath)
 	}
@@ -1165,6 +1177,14 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 		fmt.Fprintf(w, "  %s %-18s %s\n", mark, step.Name, col(statusColor(step.Status), step.Status))
 	}
 
+	// While the planner is still open, remind the human how to release the
+	// implementer from any pane without quitting the interactive planner.
+	if view.Phase == "planner" {
+		fmt.Fprintf(w, "\n%s\n", col("33", "Awaiting approval - release the implementer from any pane:"))
+		fmt.Fprintf(w, "  sidekick release --run-dir %s\n", view.State.RunDir)
+		fmt.Fprintf(w, "  sidekick abort   --run-dir %s\n", view.State.RunDir)
+	}
+
 	fmt.Fprintln(w, "\nArtifacts")
 	fmt.Fprintf(w, "  worktree: %s\n", clip(view.State.WorktreePath, width-12))
 	fmt.Fprintf(w, "  plan:     %s\n", clip(view.State.PlanFile, width-12))
@@ -1389,6 +1409,85 @@ func learnLog(state RunState) string {
 
 func markFile(path string) error {
 	return os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644)
+}
+
+// signalPlanner releases (or, with fail=true, aborts) a run waiting on planner
+// approval, by writing planner.done / planner.done.failed from any pane -- so
+// the human never has to quit the interactive planner to unblock the pipeline.
+// With no --run-dir it targets the newest run still waiting for approval.
+func signalPlanner(args []string, fail bool) error {
+	fs := flag.NewFlagSet("release", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "repository path")
+	runDir := fs.String("run-dir", "", "run directory (default: newest run awaiting approval)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	dir := *runDir
+	if dir == "" {
+		root, err := repoRoot(*repo)
+		if err != nil {
+			return err
+		}
+		dir, err = findWaitingRun(root)
+		if err != nil {
+			return err
+		}
+	}
+
+	done := filepath.Join(dir, "planner.done")
+	if fileExists(done) {
+		return fmt.Errorf("already released: %s", done)
+	}
+	if fileExists(done + ".failed") {
+		return fmt.Errorf("already aborted: %s", done+".failed")
+	}
+	if fail {
+		if err := markFile(done + ".failed"); err != nil {
+			return err
+		}
+		fmt.Printf("aborted %s\n", filepath.Base(dir))
+		return nil
+	}
+	if err := markFile(done); err != nil {
+		return err
+	}
+	fmt.Printf("released %s; implementer starts within ~2s\n", filepath.Base(dir))
+	return nil
+}
+
+// findWaitingRun returns the newest run dir under root that has a plan but no
+// planner.done/.failed yet (i.e. awaiting human approval). Run IDs are
+// timestamp-prefixed, so the lexically largest name is the newest.
+func findWaitingRun(root string) (string, error) {
+	entries, err := os.ReadDir(filepath.Join(root, runRoot))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", errors.New("no runs found")
+		}
+		return "", err
+	}
+	best := ""
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, runRoot, e.Name())
+		done := filepath.Join(dir, "planner.done")
+		if fileExists(done) || fileExists(done+".failed") {
+			continue
+		}
+		if !fileExists(filepath.Join(dir, "state.json")) {
+			continue
+		}
+		if best == "" || e.Name() > filepath.Base(best) {
+			best = dir
+		}
+	}
+	if best == "" {
+		return "", errors.New("no run is awaiting approval")
+	}
+	return best, nil
 }
 
 func terminalWidth() int {
@@ -1818,9 +1917,10 @@ When the human is happy, WRITE the final plan to this file (path is also in
 $SIDEKICK_PLAN_FILE):
 %s
 
-Do not edit any other files -- write only the plan file. When the plan file is
-saved and the human is done, end the session; Sidekick will ask them to release
-the implementer.
+Do not edit any other files -- write only the plan file. Once the plan file is
+saved, tell the human they can release the implementer WITHOUT quitting you:
+run "sidekick release" (or "sidekick abort" to cancel) in any other pane. Quitting
+you and answering the [y/N] prompt also works, but is not required.
 `, state.ID, state.TaskFile, state.MemoryFile, state.PlanFile)
 }
 
