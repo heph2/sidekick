@@ -3,5 +3,6 @@ bin/
 .sidekick/runs/
 .sidekick/worktrees/
 result
+.direnv/
 !AGENTS.md
 !CLAUDE.md
