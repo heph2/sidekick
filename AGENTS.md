@@ -8,8 +8,8 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 - Dev shell: `flake.nix`.
 - Tests: Go unit tests in `main_test.go`.
 - Runtime state: target repositories get an optional `.sidekick/config.json` and `.sidekick/runs/<id>/`.
-- Entry: bare `sidekick` (no subcommand) runs the orchestration from the current repo, prompting for the task and auto-attaching. `sidekick run` is the same path with explicit flags.
-- Orchestration: leases a Treehouse worktree when available (otherwise a plain git worktree under `.sidekick/worktrees/<id>`), creates a tmux session, and starts planner, dashboard, implementer, reviewer, optional gate, and land windows.
+- Entry: bare `sidekick` (no subcommand) opens a persistent console session (`sidekick console` running in a `console` window) that keeps prompting for tasks; `sidekick run` stays the scriptable one-shot with explicit flags (`--task`, `--no-attach`, etc.).
+- Orchestration: leases a Treehouse worktree when available (otherwise a plain git worktree under `.sidekick/worktrees/<id>`), creates or reuses a tmux session, and starts planner, dashboard, implementer, reviewer, optional gate, and land windows for each run. Inside the console, every run's windows are prefixed (`t1-planner`, `t2-planner`, ...) so multiple tasks run side by side, each in its own worktree and branch.
 
 ## Workflow
 
@@ -18,7 +18,7 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 - Reviewers wait for `implement.done`, then review the worktree diff.
 - Optional gate runs the configured `no-mistakes` command after implementation.
 - Land window waits for `implement.done` (and `gate.done` when gated), commits the worktree, then prompts before pushing the branch and opening a PR via `gh`. Skip with `--no-land`.
-- Dashboard runs `sidekick status --watch` and renders the goal, phase, pipeline state, artifacts, recent logs, and ASCII Sidekick mascot, with ANSI color on a TTY (honors `NO_COLOR`).
+- Dashboard runs `sidekick status --watch` and renders the goal, phase, pipeline state, artifacts, recent logs, and the Sidekick sparkle mascot, with a truecolor gradient on a TTY (honors `NO_COLOR`).
 
 ## Conventions
 
@@ -28,9 +28,9 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 - Agent configs may set `prompt` to override planner, implementer, or reviewer initial prompts; Sidekick expands `$SIDEKICK_*` run variables.
 - `notify` config uses terminal bell by default and may run a user-supplied `notify.command`; desktop notification commands are not auto-detected.
 - Do not commit generated binaries such as `bin/sidekick`.
-- Preserve ASCII-only source files unless a change explicitly requires otherwise.
+- Preserve ASCII-only source files unless a change explicitly requires otherwise. The mascot is a sanctioned exception: it uses 24-bit truecolor escapes (`fg`/`mascotColored` in `main.go`) to render a warm orange-to-pink gradient, gated off exactly like `col()` (no-op under `NO_COLOR` or a non-TTY), so plain-text and piped output stay clean.
 - Run `gofmt -w` on Go files, then `go test ./...` and `go build -o bin/sidekick .`.
 
 ## Product Direction
 
-Sidekick should feel like a support-console companion: the human is the hero, and Sidekick keeps the agent loop visible and moving. The current mascot is an original wood-hero inspired ASCII mark based on the requested Kamui Woods direction, not copied artwork.
+Sidekick should feel like a support-console companion: the human is the hero, and Sidekick keeps the agent loop visible and moving. The mascot is a small sparkle mark (star/dot glyphs with a warm gradient) paired with the "sidekick / always-on companion" wordmark - a lightweight visual signature rather than illustrative art.

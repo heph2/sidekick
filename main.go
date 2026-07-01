@@ -91,7 +91,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 2 {
-		return startRun(nil)
+		return startConsole(nil)
 	}
 
 	switch args[1] {
@@ -99,6 +99,8 @@ func run(args []string) error {
 		return initConfig(args[2:])
 	case "run":
 		return startRun(args[2:])
+	case "console":
+		return consoleLoop(args[2:])
 	case "status":
 		return showStatus(args[2:])
 	case "agent":
@@ -117,7 +119,7 @@ func run(args []string) error {
 		// ponytail: bare flags (e.g. `sidekick --no-attach`) mean the hero
 		// path, not a subcommand. Anything else is a typo'd command.
 		if strings.HasPrefix(args[1], "-") {
-			return startRun(args[1:])
+			return startConsole(args[1:])
 		}
 		return fmt.Errorf("unknown command %q\n\n%s", args[1], usageText())
 	}
@@ -134,7 +136,9 @@ func usageText() string {
 sidekick orchestrates planner, implementer, and reviewer agent harnesses.
 
 Usage:
-  sidekick [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-land] [--no-attach]
+  sidekick [--repo PATH] [--gate] [--no-land] [--no-attach]
+  sidekick run [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-land] [--no-attach]
+  sidekick console [--repo PATH] [--gate] [--no-land]
   sidekick status --run-dir PATH [--watch] [--interval 2s]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
@@ -145,7 +149,8 @@ Usage:
 
 Typical flow:
   cd /path/to/project
-  sidekick          # prompts for the task, leases a worktree, attaches
+  sidekick          # opens a persistent console; keep giving it tasks
+  sidekick run --task "..." --no-attach   # scriptable one-shot run
 
 No config or treehouse setup is required: sidekick uses built-in defaults and
 falls back to a plain git worktree when treehouse is unavailable.
@@ -231,75 +236,204 @@ func startRun(args []string) error {
 	if err != nil {
 		return fmt.Errorf("implementer: %w", err)
 	}
+	cfg.Agents.Planner = plannerAgent
+	cfg.Agents.Implementer = implementerAgent
 	if len(cfg.Agents.Reviewers) == 0 {
 		return errors.New("at least one reviewer agent is required")
 	}
 
-	if err := requireBinary("tmux"); err != nil {
-		return err
-	}
 	gateEnabled := *gate || cfg.Gate.Enabled
-	if gateEnabled {
-		if err := requireCommand(cfg.Gate.Command); err != nil {
-			return fmt.Errorf("gate: %w", err)
-		}
-	}
-	for _, agent := range append([]AgentConfig{plannerAgent, implementerAgent}, cfg.Agents.Reviewers...) {
-		if err := requireAgent(agent); err != nil {
-			return err
-		}
+	if err := validateAgents(cfg, gateEnabled); err != nil {
+		return err
 	}
 
 	runID := newRunID(taskText)
-	runDir := filepath.Join(root, runRoot, runID)
-	if err := os.MkdirAll(runDir, 0o755); err != nil {
-		return err
-	}
-
-	worktree, backend, err := leaseWorktree(root, runID)
+	session := "sidekick-" + runID
+	bootstrap, err := newBootstrapSession(session, root)
 	if err != nil {
 		return err
 	}
 
-	state := RunState{
-		ID:              runID,
-		CreatedAt:       time.Now(),
-		RepoRoot:        root,
-		RunDir:          runDir,
-		TaskFile:        filepath.Join(runDir, "task.md"),
-		PlanFile:        filepath.Join(runDir, "plan.md"),
-		PlannerDone:     filepath.Join(runDir, "planner.done"),
-		ImplementDone:   filepath.Join(runDir, "implement.done"),
-		WorktreePath:    worktree,
-		WorktreeBackend: backend,
-		TmuxSession:     "sidekick-" + runID,
-		GateEnabled:     gateEnabled,
-		PlannerName:     plannerAgent.Name,
-		ImplementerName: implementerAgent.Name,
-	}
-	for _, reviewer := range cfg.Agents.Reviewers {
-		state.ReviewerNames = append(state.ReviewerNames, reviewer.Name)
-	}
-
-	if err := writeRunFiles(state, taskText, cfg); err != nil {
+	state, err := spawnRun(session, "", root, cfg, taskText, gateEnabled, !*noLand)
+	if err != nil {
 		return err
 	}
-	if err := writeState(state); err != nil {
-		return err
-	}
-	if err := createTmuxSession(root, cfg, state, gateEnabled, !*noLand); err != nil {
+	_ = exec.Command("tmux", "kill-window", "-t", session+":"+bootstrap).Run()
+	if err := exec.Command("tmux", "select-window", "-t", session+":dashboard").Run(); err != nil {
 		return err
 	}
 
 	fmt.Printf("run: %s\n", state.ID)
 	fmt.Printf("session: %s\n", state.TmuxSession)
 	fmt.Printf("worktree: %s\n", state.WorktreePath)
-	fmt.Printf("state: %s\n", filepath.Join(runDir, "state.json"))
+	fmt.Printf("state: %s\n", filepath.Join(state.RunDir, "state.json"))
 	if *noAttach {
 		fmt.Printf("attach: tmux attach -t %s\n", state.TmuxSession)
 		return nil
 	}
 	return attachTmux(state.TmuxSession)
+}
+
+// validateAgents checks that tmux, the gate command (when enabled), and every
+// configured agent are runnable before any run is spawned.
+func validateAgents(cfg Config, gateEnabled bool) error {
+	if err := requireBinary("tmux"); err != nil {
+		return err
+	}
+	if gateEnabled {
+		if err := requireCommand(cfg.Gate.Command); err != nil {
+			return fmt.Errorf("gate: %w", err)
+		}
+	}
+	for _, agent := range cfg.AllAgents() {
+		if err := requireAgent(agent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// startConsole is the bare `sidekick` entry point: it opens a persistent
+// session with a single "console" window running `sidekick console`, which
+// prompts for tasks in a loop and spawns each one into its own windows within
+// the same session.
+func startConsole(args []string) error {
+	fs := flag.NewFlagSet("console-launcher", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "target repository")
+	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
+	noAttach := fs.Bool("no-attach", false, "do not attach to the tmux session after creating it")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	root, err := repoRoot(*repo)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Agents.Reviewers) == 0 {
+		return errors.New("at least one reviewer agent is required")
+	}
+	gateEnabled := *gate || cfg.Gate.Enabled
+	if err := validateAgents(cfg, gateEnabled); err != nil {
+		return err
+	}
+
+	stamp := time.Now().Format("20060102-150405")
+	session := "sidekick-" + stamp
+	consoleArgs := []string{self(), "console", "--repo", root}
+	if gateEnabled {
+		consoleArgs = append(consoleArgs, "--gate")
+	}
+	if *noLand {
+		consoleArgs = append(consoleArgs, "--no-land")
+	}
+	consoleCmd := shellJoin(consoleArgs...)
+	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", "console", "-c", root).Run(); err != nil {
+		return fmt.Errorf("create tmux session: %w", err)
+	}
+	consolePane, err := tmuxPaneID(session + ":console")
+	if err != nil {
+		return err
+	}
+	if err := tmuxSend(consolePane, consoleCmd); err != nil {
+		return err
+	}
+
+	fmt.Printf("session: %s\n", session)
+	if *noAttach {
+		fmt.Printf("attach: tmux attach -t %s\n", session)
+		return nil
+	}
+	return attachTmux(session)
+}
+
+// consoleLoop runs inside the console window: it repeatedly prompts for a
+// task and spawns it into new windows in the current session, without ever
+// blocking on a run's completion, so the console is free for the next task
+// while prior runs proceed asynchronously.
+func consoleLoop(args []string) error {
+	fs := flag.NewFlagSet("console", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "target repository")
+	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	root, err := repoRoot(*repo)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Agents.Reviewers) == 0 {
+		return errors.New("at least one reviewer agent is required")
+	}
+	gateEnabled := *gate || cfg.Gate.Enabled
+	if err := validateAgents(cfg, gateEnabled); err != nil {
+		return err
+	}
+
+	sessionOut, err := exec.Command("tmux", "display-message", "-p", "#{session_name}").Output()
+	if err != nil {
+		return fmt.Errorf("resolve tmux session: %w", err)
+	}
+	session := strings.TrimSpace(string(sessionOut))
+
+	land := !*noLand
+	in := bufio.NewReader(os.Stdin)
+	for idx := 1; ; idx++ {
+		fmt.Print(mascotColored())
+		fmt.Println()
+		fmt.Println("Give Sidekick a task; each one gets its own windows. Type quit/exit to leave the console.")
+
+		taskText, eof, err := consoleReadLine(in)
+		if err != nil {
+			return err
+		}
+		if eof {
+			return nil
+		}
+		if taskText == "" {
+			idx--
+			continue
+		}
+		switch strings.ToLower(taskText) {
+		case "quit", "exit":
+			return nil
+		}
+
+		prefix := fmt.Sprintf("t%d-", idx)
+		state, err := spawnRun(session, prefix, root, cfg, taskText, gateEnabled, land)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sidekick: %v\n", err)
+			idx--
+			continue
+		}
+		fmt.Printf("run %s started; windows %s*\n\n", state.ID, prefix)
+	}
+}
+
+// consoleReadLine reads one line for the console loop, reporting EOF (e.g.
+// Ctrl-D or a closed pipe) distinctly from a blank line so the loop can exit
+// on EOF but reprompt on blank input.
+func consoleReadLine(in *bufio.Reader) (line string, eof bool, err error) {
+	fmt.Fprint(os.Stderr, "Task> ")
+	text, err := in.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return strings.TrimSpace(text), true, nil
+		}
+		return "", false, err
+	}
+	return strings.TrimSpace(text), false, nil
 }
 
 // readTask sources the task when --task is absent: an interactive prompt on a
@@ -983,7 +1117,7 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 		width = 120
 	}
 
-	fmt.Fprint(w, col("36", mascot()))
+	fmt.Fprint(w, mascotColored())
 	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", width))
 	fmt.Fprintf(w, "Sidekick run: %s\n", view.State.ID)
 	fmt.Fprintf(w, "Phase: %s | Elapsed: %s\n", col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
@@ -1231,16 +1365,52 @@ func clip(s string, max int) string {
 }
 
 func mascot() string {
-	return `       /\  /\        Sidekick
-      /  \/  \       wood-hero support console
-     / /\  /\ \
-    | |  ||  | |
-    | |__||__| |
-    |  \____/  |
-   /|  /||||\  |\
-  /_|_/ |||| \_|_\
-     /\_||||_/\
-    /__/    \__\`
+	return `      .        *          Sidekick
+   *    \   .    /   *
+      \  \  |  /  /       always-on companion
+  - -- >   \|/   < -- -
+      /  /  |  \  \
+   *    /   '   \    *`
+}
+
+// fg wraps s in a 24-bit truecolor ANSI escape, gated by the same rule as
+// col: no-op when NO_COLOR is set or stdout is not a TTY.
+//
+// ponytail: assumes the terminal supports truecolor; the honest upgrade path
+// is to gate on COLORTERM=truecolor/24bit and fall back to the existing
+// 256-color col() when it isn't set. Not built - most terminals people use
+// today (including tmux with default-terminal set right) support it, and a
+// wrong guess just means a slightly off gradient, not broken output.
+func fg(r, g, b int, s string) string {
+	if os.Getenv("NO_COLOR") != "" || !stdoutIsTTY() {
+		return s
+	}
+	return fmt.Sprintf("\033[38;2;%d;%d;%dm%s\033[0m", r, g, b, s)
+}
+
+// lerp linearly interpolates between from and to at t in [0,1].
+func lerp(from, to int, t float64) int {
+	return from + int(float64(to-from)*t)
+}
+
+// mascotColored renders the sparkle mascot with an orange->pink gradient
+// applied per line.
+func mascotColored() string {
+	from := [3]int{255, 140, 0}
+	to := [3]int{255, 105, 180}
+	lines := strings.Split(mascot(), "\n")
+	last := len(lines) - 1
+	for i, line := range lines {
+		t := 0.0
+		if last > 0 {
+			t = float64(i) / float64(last)
+		}
+		r := lerp(from[0], to[0], t)
+		g := lerp(from[1], to[1], t)
+		b := lerp(from[2], to[2], t)
+		lines[i] = fg(r, g, b, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func writeState(state RunState) error {
@@ -1264,25 +1434,33 @@ func loadState(runDir string) (RunState, error) {
 	return state, nil
 }
 
-func createTmuxSession(root string, cfg Config, state RunState, gate, land bool) error {
-	session := state.TmuxSession
-	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", "planner", "-c", root).Run(); err != nil {
-		return fmt.Errorf("create tmux session: %w", err)
+// addRunWindows adds one run's windows (planner, dashboard, implement, review,
+// optional gate, optional land) to an existing tmux session, with every window
+// name prefixed so multiple runs can coexist in the same session. It expects
+// the session (or an empty placeholder window) to already exist and creates
+// its own prefix+"planner" window rather than reusing whatever window is
+// current, so it is safe to call into a session that already hosts other
+// runs. It does not create the session and does not select a window -
+// callers that own the session decide that.
+func addRunWindows(session, prefix string, cfg Config, state RunState, gate, land bool) error {
+	plannerWin := prefix + "planner"
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", plannerWin, "-c", state.RepoRoot).Run(); err != nil {
+		return fmt.Errorf("create planner window: %w", err)
 	}
-
-	plannerPane, err := tmuxPaneID(session + ":planner")
+	plannerPane, err := tmuxPaneID(session + ":" + plannerWin)
 	if err != nil {
 		return err
 	}
-	plannerCmd := shellJoin(self(), "agent", "--repo", root, "--run-dir", state.RunDir, "--role", "planner", "--prompt", filepath.Join(state.RunDir, "planner.prompt.md"), "--output", state.PlanFile, "--done", state.PlannerDone)
+	plannerCmd := shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "planner", "--prompt", filepath.Join(state.RunDir, "planner.prompt.md"), "--output", state.PlanFile, "--done", state.PlannerDone)
 	if err := tmuxSend(plannerPane, plannerCmd); err != nil {
 		return err
 	}
 
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", "dashboard", "-c", state.WorktreePath).Run(); err != nil {
+	dashboardWin := prefix + "dashboard"
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", dashboardWin, "-c", state.WorktreePath).Run(); err != nil {
 		return err
 	}
-	dashboardPane, err := tmuxPaneID(session + ":dashboard")
+	dashboardPane, err := tmuxPaneID(session + ":" + dashboardWin)
 	if err != nil {
 		return err
 	}
@@ -1291,10 +1469,11 @@ func createTmuxSession(root string, cfg Config, state RunState, gate, land bool)
 		return err
 	}
 
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", "implement", "-c", state.WorktreePath).Run(); err != nil {
+	implementWin := prefix + "implement"
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", implementWin, "-c", state.WorktreePath).Run(); err != nil {
 		return err
 	}
-	implementPane, err := tmuxPaneID(session + ":implement")
+	implementPane, err := tmuxPaneID(session + ":" + implementWin)
 	if err != nil {
 		return err
 	}
@@ -1303,16 +1482,17 @@ func createTmuxSession(root string, cfg Config, state RunState, gate, land bool)
 		return err
 	}
 
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", "review", "-c", state.WorktreePath).Run(); err != nil {
+	reviewWin := prefix + "review"
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", reviewWin, "-c", state.WorktreePath).Run(); err != nil {
 		return err
 	}
-	reviewPane, err := tmuxPaneID(session + ":review")
+	reviewPane, err := tmuxPaneID(session + ":" + reviewWin)
 	if err != nil {
 		return err
 	}
 	for i, reviewer := range cfg.Agents.Reviewers {
 		if i > 0 {
-			reviewPane, err = tmuxSplitPane(session+":review", state.WorktreePath)
+			reviewPane, err = tmuxSplitPane(session+":"+reviewWin, state.WorktreePath)
 			if err != nil {
 				return err
 			}
@@ -1326,14 +1506,15 @@ func createTmuxSession(root string, cfg Config, state RunState, gate, land bool)
 		}
 	}
 	if len(cfg.Agents.Reviewers) > 1 {
-		_ = exec.Command("tmux", "select-layout", "-t", session+":review", "tiled").Run()
+		_ = exec.Command("tmux", "select-layout", "-t", session+":"+reviewWin, "tiled").Run()
 	}
 
 	if gate {
-		if err := exec.Command("tmux", "new-window", "-t", session, "-n", "gate", "-c", state.WorktreePath).Run(); err != nil {
+		gateWin := prefix + "gate"
+		if err := exec.Command("tmux", "new-window", "-t", session, "-n", gateWin, "-c", state.WorktreePath).Run(); err != nil {
 			return err
 		}
-		gatePane, err := tmuxPaneID(session + ":gate")
+		gatePane, err := tmuxPaneID(session + ":" + gateWin)
 		if err != nil {
 			return err
 		}
@@ -1344,10 +1525,11 @@ func createTmuxSession(root string, cfg Config, state RunState, gate, land bool)
 	}
 
 	if land {
-		if err := exec.Command("tmux", "new-window", "-t", session, "-n", "land", "-c", state.WorktreePath).Run(); err != nil {
+		landWin := prefix + "land"
+		if err := exec.Command("tmux", "new-window", "-t", session, "-n", landWin, "-c", state.WorktreePath).Run(); err != nil {
 			return err
 		}
-		landPane, err := tmuxPaneID(session + ":land")
+		landPane, err := tmuxPaneID(session + ":" + landWin)
 		if err != nil {
 			return err
 		}
@@ -1362,7 +1544,85 @@ func createTmuxSession(root string, cfg Config, state RunState, gate, land bool)
 		}
 	}
 
-	return exec.Command("tmux", "select-window", "-t", session+":dashboard").Run()
+	return nil
+}
+
+// newBootstrapSession creates a new detached tmux session with a throwaway
+// window (tmux requires -n on new-session) in root's directory, returning the
+// bootstrap window's name so the caller can kill it once real windows exist.
+func newBootstrapSession(session, root string) (string, error) {
+	bootstrap := "bootstrap"
+	if err := exec.Command("tmux", "new-session", "-d", "-s", session, "-n", bootstrap, "-c", root).Run(); err != nil {
+		return "", fmt.Errorf("create tmux session: %w", err)
+	}
+	return bootstrap, nil
+}
+
+// spawnRun leases a worktree, writes run files and state, and adds the run's
+// windows to an existing tmux session under the given window-name prefix. It
+// does not create the session and does not attach; the caller decides that.
+func spawnRun(session, prefix, root string, cfg Config, task string, gate, land bool) (RunState, error) {
+	runID, runDir, err := uniqueRunDir(root, task)
+	if err != nil {
+		return RunState{}, err
+	}
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		return RunState{}, err
+	}
+
+	worktree, backend, err := leaseWorktree(root, runID)
+	if err != nil {
+		return RunState{}, err
+	}
+
+	plannerAgent := normalizeAgent(cfg.Agents.Planner)
+	implementerAgent := normalizeAgent(cfg.Agents.Implementer)
+
+	state := RunState{
+		ID:              runID,
+		CreatedAt:       time.Now(),
+		RepoRoot:        root,
+		RunDir:          runDir,
+		TaskFile:        filepath.Join(runDir, "task.md"),
+		PlanFile:        filepath.Join(runDir, "plan.md"),
+		PlannerDone:     filepath.Join(runDir, "planner.done"),
+		ImplementDone:   filepath.Join(runDir, "implement.done"),
+		WorktreePath:    worktree,
+		WorktreeBackend: backend,
+		TmuxSession:     session,
+		GateEnabled:     gate,
+		PlannerName:     plannerAgent.Name,
+		ImplementerName: implementerAgent.Name,
+	}
+	for _, reviewer := range cfg.Agents.Reviewers {
+		state.ReviewerNames = append(state.ReviewerNames, reviewer.Name)
+	}
+
+	if err := writeRunFiles(state, task, cfg); err != nil {
+		return RunState{}, err
+	}
+	if err := writeState(state); err != nil {
+		return RunState{}, err
+	}
+	if err := addRunWindows(session, prefix, cfg, state, gate, land); err != nil {
+		return RunState{}, err
+	}
+	return state, nil
+}
+
+// uniqueRunDir picks a run ID/dir for task under root, guarding against
+// newRunID's 1-second granularity: if the directory already exists (two
+// spawns within the same second), it suffixes -2, -3, ... until free.
+func uniqueRunDir(root, task string) (string, string, error) {
+	base := newRunID(task)
+	id := base
+	for i := 2; ; i++ {
+		dir := filepath.Join(root, runRoot, id)
+		if !fileExists(dir) {
+			return id, dir, nil
+		}
+		id = fmt.Sprintf("%s-%d", base, i)
+	}
 }
 
 func attachTmux(session string) error {

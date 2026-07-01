@@ -237,7 +237,7 @@ func TestRenderStatusIncludesMascotAndArtifacts(t *testing.T) {
 		t.Fatalf("renderStatus() error = %v", err)
 	}
 	text := out.String()
-	for _, want := range []string{"Sidekick", "wood-hero support console", "Ship the dashboard", "worktree:"} {
+	for _, want := range []string{"Sidekick", "always-on companion", "Ship the dashboard", "worktree:"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, text)
 		}
@@ -334,7 +334,8 @@ func TestLandCommit(t *testing.T) {
 }
 
 func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
-	// go test stdout is not a TTY, so col() must emit no escape codes.
+	// go test stdout is not a TTY, so col() and the mascot's fg() must emit no
+	// escape codes.
 	state := testRunState(t, false)
 	if err := writeState(state); err != nil {
 		t.Fatal(err)
@@ -348,6 +349,70 @@ func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "\033[") {
 		t.Fatalf("dashboard leaked ANSI escapes to non-tty output:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "Sidekick") {
+		t.Fatalf("dashboard missing plain mascot text:\n%s", buf.String())
+	}
+}
+
+func TestLerp(t *testing.T) {
+	if got := lerp(10, 20, 0); got != 10 {
+		t.Fatalf("lerp(10,20,0) = %d, want 10", got)
+	}
+	if got := lerp(10, 20, 1); got != 20 {
+		t.Fatalf("lerp(10,20,1) = %d, want 20", got)
+	}
+	got := lerp(0, 10, 0.5)
+	if got <= 0 || got >= 10 {
+		t.Fatalf("lerp(0,10,0.5) = %d, want strictly between 0 and 10", got)
+	}
+}
+
+func TestFgAndMascotColoredNoColorWhenNotTTY(t *testing.T) {
+	// go test stdout is not a TTY, so fg() must be a no-op like col().
+	if got := fg(255, 0, 0, "x"); got != "x" {
+		t.Fatalf("fg() = %q, want %q (no escapes on non-tty)", got, "x")
+	}
+	colored := mascotColored()
+	if strings.Contains(colored, "\033[") {
+		t.Fatalf("mascotColored() leaked ANSI escapes to non-tty output:\n%s", colored)
+	}
+	if colored != mascot() {
+		t.Fatalf("mascotColored() on non-tty should equal plain mascot()")
+	}
+}
+
+func TestUniqueRunDirDistinctOnCollision(t *testing.T) {
+	root := t.TempDir()
+	id1, dir1, err := uniqueRunDir(root, "same task")
+	if err != nil {
+		t.Fatalf("uniqueRunDir() error = %v", err)
+	}
+	if err := os.MkdirAll(dir1, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id2, dir2, err := uniqueRunDir(root, "same task")
+	if err != nil {
+		t.Fatalf("uniqueRunDir() error = %v", err)
+	}
+	if id1 == id2 || dir1 == dir2 {
+		t.Fatalf("uniqueRunDir() collided: %q == %q", dir1, dir2)
+	}
+	if !strings.HasSuffix(id2, "-2") {
+		t.Fatalf("id2 = %q, want suffix -2", id2)
+	}
+	if err := os.MkdirAll(dir2, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	id3, dir3, err := uniqueRunDir(root, "same task")
+	if err != nil {
+		t.Fatalf("uniqueRunDir() error = %v", err)
+	}
+	if dir3 == dir1 || dir3 == dir2 {
+		t.Fatalf("uniqueRunDir() collided on third call: %q", dir3)
+	}
+	if !strings.HasSuffix(id3, "-3") {
+		t.Fatalf("id3 = %q, want suffix -3", id3)
 	}
 }
 
