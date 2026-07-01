@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,9 +24,10 @@ const (
 )
 
 type Config struct {
-	Agents AgentsConfig `json:"agents"`
-	Gate   GateConfig   `json:"gate"`
-	Notify NotifyConfig `json:"notify"`
+	Agents          AgentsConfig `json:"agents"`
+	Gate            GateConfig   `json:"gate"`
+	Notify          NotifyConfig `json:"notify"`
+	MaxReviewCycles int          `json:"maxReviewCycles,omitempty"`
 }
 
 type NotifyConfig struct {
@@ -110,6 +112,8 @@ func run(args []string) error {
 		return showStatus(args[2:])
 	case "agent":
 		return runAgent(args[2:])
+	case "cycle":
+		return runCycle(args[2:])
 	case "gate":
 		return runGate(args[2:])
 	case "wait-file":
@@ -151,6 +155,7 @@ Usage:
   sidekick status --run-dir PATH [--watch] [--interval 2s]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
+  sidekick cycle --repo PATH --run-dir PATH
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
   sidekick land --repo PATH --run-dir PATH
   sidekick release [--repo PATH] [--run-dir PATH]   # approve the newest waiting plan
@@ -165,6 +170,8 @@ Typical flow:
 
 No config or treehouse setup is required: sidekick uses built-in defaults and
 falls back to a plain git worktree when treehouse is unavailable.
+Set maxReviewCycles in .sidekick/config.json to cap implement/review loops
+(default: 3).
 `
 }
 
@@ -551,7 +558,7 @@ func runAgent(args []string) error {
 	if err != nil {
 		return err
 	}
-	agent, err := agentForRole(cfg, *role)
+	agent, err := agentForRunRole(cfg, state, *role)
 	if err != nil {
 		return err
 	}
@@ -606,6 +613,195 @@ func runAgent(args []string) error {
 		}
 	}
 	return nil
+}
+
+func runCycle(args []string) error {
+	fs := flag.NewFlagSet("cycle", flag.ContinueOnError)
+	repo := fs.String("repo", "", "real repository root, used for config")
+	runDir := fs.String("run-dir", "", "run directory")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *repo == "" || *runDir == "" {
+		return errors.New("--repo and --run-dir are required")
+	}
+
+	root, err := repoRoot(*repo)
+	if err != nil {
+		return err
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	state, err := loadState(*runDir)
+	if err != nil {
+		return err
+	}
+	if len(state.ReviewerNames) == 0 {
+		return errors.New("at least one reviewer is required")
+	}
+	if state.RepoRoot == "" {
+		state.RepoRoot = root
+	}
+
+	implementer := agentConfigByName(cfg.AllAgents(), state.ImplementerName, cfg.Agents.Implementer)
+	max := cfg.MaxReviewCycles
+	feedbackPath := filepath.Join(state.RunDir, "review-feedback.md")
+
+	for iter := 1; iter <= max; iter++ {
+		writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: implementing", iter, max))
+		prompt := implementerPrompt(state, implementer)
+		if iter > 1 {
+			prompt += fmt.Sprintf(`
+
+## Reviewer feedback (previous round)
+
+Reviewers requested changes in the previous round. Read:
+%s
+
+Address every concrete point before summarizing your validation.
+`, feedbackPath)
+		}
+		implementPromptPath := filepath.Join(state.RunDir, "implementer.prompt.md")
+		if err := os.WriteFile(implementPromptPath, []byte(prompt), 0o644); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return err
+		}
+		if err := runSidekickAgent(state, root, "implementer", implementPromptPath, implementerLog(state)); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return fmt.Errorf("implementer cycle %d/%d: %w", iter, max, err)
+		}
+
+		writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: reviewing", iter, max))
+		results := runReviewers(state, root)
+		needsRevision := false
+		for _, result := range results {
+			if result.Verdict == "revise" {
+				needsRevision = true
+				break
+			}
+		}
+		if !needsRevision {
+			for _, reviewer := range state.ReviewerNames {
+				if err := markFile(reviewerDone(state, reviewer)); err != nil {
+					_ = markFile(state.ImplementDone + ".failed")
+					return err
+				}
+			}
+			_ = os.Remove(feedbackPath)
+			writeCycleStatus(state, fmt.Sprintf("cycle %d/%d: approved", iter, max))
+			return markFile(state.ImplementDone)
+		}
+		if err := writeReviewFeedback(feedbackPath, results); err != nil {
+			_ = markFile(state.ImplementDone + ".failed")
+			return err
+		}
+	}
+
+	writeCycleStatus(state, fmt.Sprintf("cycle cap %d reached; review still requests changes", max))
+	_ = markFile(state.ImplementDone + ".failed")
+	return fmt.Errorf("review cycle cap %d reached with unresolved reviewer feedback", max)
+}
+
+type reviewResult struct {
+	Name    string
+	LogPath string
+	Verdict string
+	Err     error
+}
+
+func runSidekickAgent(state RunState, repo, role, promptPath, outputPath string) error {
+	cmd := exec.Command(self(), "agent", "--repo", repo, "--run-dir", state.RunDir, "--role", role, "--prompt", promptPath, "--output", outputPath)
+	cmd.Dir = state.WorktreePath
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func runReviewers(state RunState, repo string) []reviewResult {
+	results := make([]reviewResult, len(state.ReviewerNames))
+	var wg sync.WaitGroup
+	for i, reviewer := range state.ReviewerNames {
+		i, reviewer := i, reviewer
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			role := "reviewer-" + slug(reviewer)
+			promptPath := filepath.Join(state.RunDir, role+".prompt.md")
+			logPath := reviewerLog(state, reviewer)
+			err := runSidekickAgent(state, repo, role, promptPath, logPath)
+			results[i] = reviewResult{
+				Name:    reviewer,
+				LogPath: logPath,
+				Verdict: reviewVerdict(logPath, err),
+				Err:     err,
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func reviewVerdict(logPath string, processErr error) string {
+	if processErr != nil {
+		return "revise"
+	}
+	return parseVerdict(logPath)
+}
+
+var verdictLineRE = regexp.MustCompile(`(?i)^\s*SIDEKICK_VERDICT:\s*([a-z-]+)`)
+
+func parseVerdict(logPath string) string {
+	file, err := os.Open(logPath)
+	if err != nil {
+		return "approve"
+	}
+	defer file.Close()
+
+	last := ""
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		match := verdictLineRE.FindStringSubmatch(scanner.Text())
+		if len(match) == 2 {
+			last = strings.ToLower(match[1])
+		}
+	}
+	switch last {
+	case "approve", "approved", "lgtm":
+		return "approve"
+	case "revise", "request-changes", "changes":
+		return "revise"
+	default:
+		return "approve"
+	}
+}
+
+func writeReviewFeedback(path string, results []reviewResult) error {
+	var b strings.Builder
+	b.WriteString("# Reviewer feedback\n\n")
+	for _, result := range results {
+		if result.Verdict != "revise" {
+			continue
+		}
+		fmt.Fprintf(&b, "## %s\n\n", result.Name)
+		if result.Err != nil {
+			fmt.Fprintf(&b, "Reviewer process failed: %v\n\n", result.Err)
+		}
+		data, err := os.ReadFile(result.LogPath)
+		if err != nil {
+			fmt.Fprintf(&b, "Could not read reviewer log %s: %v\n\n", result.LogPath, err)
+			continue
+		}
+		b.Write(bytes.TrimSpace(data))
+		b.WriteString("\n\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeCycleStatus(state RunState, msg string) {
+	fmt.Println(msg)
+	_ = os.WriteFile(filepath.Join(state.RunDir, "cycle.status"), []byte(msg+"\n"), 0o644)
 }
 
 // runInteractiveAgent attaches the harness to the pane's TTY (a live chat, no
@@ -795,6 +991,9 @@ func loadConfig(root string) (Config, error) {
 
 func (cfg Config) withDefaults() Config {
 	def := defaultConfig()
+	if cfg.MaxReviewCycles <= 0 {
+		cfg.MaxReviewCycles = 3
+	}
 	if cfg.Agents.Planner.Name == "" {
 		cfg.Agents.Planner = def.Agents.Planner
 	}
@@ -848,19 +1047,38 @@ func selectAgent(agents []AgentConfig, fallback, name string) (AgentConfig, erro
 }
 
 func agentForRole(cfg Config, role string) (AgentConfig, error) {
+	return agentForRunRole(cfg, RunState{}, role)
+}
+
+func agentForRunRole(cfg Config, state RunState, role string) (AgentConfig, error) {
 	role = strings.TrimSpace(role)
 	if role == "planner" {
+		if state.PlannerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.PlannerName, cfg.Agents.Planner)), nil
+		}
 		return normalizeAgent(cfg.Agents.Planner), nil
 	}
 	if role == "implementer" {
+		if state.ImplementerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.ImplementerName, cfg.Agents.Implementer)), nil
+		}
 		return normalizeAgent(cfg.Agents.Implementer), nil
 	}
 	if role == "learn" {
+		if state.LearnerName != "" {
+			return normalizeAgent(agentConfigByName(cfg.AllAgents(), state.LearnerName, cfg.Agents.Learner)), nil
+		}
 		return normalizeAgent(cfg.Agents.Learner), nil
 	}
-	for _, reviewer := range cfg.Agents.Reviewers {
-		if role == "reviewer-"+slug(reviewer.Name) {
-			return normalizeAgent(reviewer), nil
+	reviewerNames := state.ReviewerNames
+	if len(reviewerNames) == 0 {
+		for _, reviewer := range cfg.Agents.Reviewers {
+			reviewerNames = append(reviewerNames, reviewer.Name)
+		}
+	}
+	for _, reviewerName := range reviewerNames {
+		if role == "reviewer-"+slug(reviewerName) {
+			return normalizeAgent(agentConfigByName(cfg.Agents.Reviewers, reviewerName, AgentConfig{Name: reviewerName})), nil
 		}
 	}
 	return AgentConfig{}, fmt.Errorf("unknown role %q", role)
@@ -1146,6 +1364,7 @@ type StatusView struct {
 	State       RunState
 	Goal        string
 	Phase       string
+	Cycle       string
 	Elapsed     time.Duration
 	Steps       []PipelineStep
 	RecentTitle string
@@ -1168,6 +1387,9 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", width))
 	fmt.Fprintf(w, "Sidekick run: %s\n", view.State.ID)
 	fmt.Fprintf(w, "Phase: %s | Elapsed: %s\n", col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
+	if view.Cycle != "" {
+		fmt.Fprintf(w, "Cycle: %s\n", view.Cycle)
+	}
 	fmt.Fprintf(w, "Goal: %s\n", col("1", clip(view.Goal, width-6)))
 	fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", width))
 
@@ -1210,6 +1432,7 @@ func buildStatusView(runDir string) (StatusView, error) {
 	view := StatusView{
 		State:   state,
 		Goal:    firstLine(state.TaskFile),
+		Cycle:   readLine(filepath.Join(state.RunDir, "cycle.status")),
 		Elapsed: time.Since(state.CreatedAt),
 	}
 	view.Steps = append(view.Steps, PipelineStep{Name: "planner", Status: stepStatus(state.PlannerDone, state.PlanFile), Log: state.PlanFile})
@@ -1217,7 +1440,7 @@ func buildStatusView(runDir string) (StatusView, error) {
 	for _, reviewer := range state.ReviewerNames {
 		log := reviewerLog(state, reviewer)
 		done := reviewerDone(state, reviewer)
-		view.Steps = append(view.Steps, PipelineStep{Name: "review " + reviewer, Status: gatedStepStatus(state.ImplementDone, done, log), Log: log})
+		view.Steps = append(view.Steps, PipelineStep{Name: "review " + reviewer, Status: gatedStepStatus(state.PlannerDone, done, log), Log: log})
 	}
 	if state.GateEnabled {
 		log := gateLog(state)
@@ -1357,6 +1580,20 @@ func firstLine(path string) string {
 		}
 	}
 	return "empty task"
+}
+
+func readLine(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func lastLines(path string, count int) []string {
@@ -1580,14 +1817,14 @@ func loadState(runDir string) (RunState, error) {
 	return state, nil
 }
 
-// addRunWindows adds one run's windows (planner, dashboard, implement, review,
-// optional gate, optional learn, optional land) to an existing tmux session, with every window
-// name prefixed so multiple runs can coexist in the same session. It expects
-// the session (or an empty placeholder window) to already exist and creates
-// its own prefix+"planner" window rather than reusing whatever window is
-// current, so it is safe to call into a session that already hosts other
-// runs. It does not create the session and does not select a window -
-// callers that own the session decide that.
+// addRunWindows adds one run's windows (planner, dashboard, cycle, optional
+// gate, optional learn, optional land) to an existing tmux session, with every
+// window name prefixed so multiple runs can coexist in the same session. It
+// expects the session (or an empty placeholder window) to already exist and
+// creates its own prefix+"planner" window rather than reusing whatever window
+// is current, so it is safe to call into a session that already hosts other
+// runs. It does not create the session and does not select a window - callers
+// that own the session decide that.
 func addRunWindows(session, prefix string, cfg Config, state RunState, gate, learn, land bool) error {
 	plannerWin := prefix + "planner"
 	if err := exec.Command("tmux", "new-window", "-t", session, "-n", plannerWin, "-c", state.RepoRoot).Run(); err != nil {
@@ -1615,44 +1852,17 @@ func addRunWindows(session, prefix string, cfg Config, state RunState, gate, lea
 		return err
 	}
 
-	implementWin := prefix + "implement"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", implementWin, "-c", state.WorktreePath).Run(); err != nil {
+	cycleWin := prefix + "cycle"
+	if err := exec.Command("tmux", "new-window", "-t", session, "-n", cycleWin, "-c", state.WorktreePath).Run(); err != nil {
 		return err
 	}
-	implementPane, err := tmuxPaneID(session + ":" + implementWin)
+	cyclePane, err := tmuxPaneID(session + ":" + cycleWin)
 	if err != nil {
 		return err
 	}
-	implementCmd := shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", "implementer", "--prompt", filepath.Join(state.RunDir, "implementer.prompt.md"), "--output", filepath.Join(state.RunDir, "implementer.log"), "--done", state.ImplementDone)
-	if err := tmuxSend(implementPane, implementCmd); err != nil {
+	cycleCmd := shellJoin(self(), "wait-file", state.PlannerDone) + " && " + shellJoin(self(), "cycle", "--repo", state.RepoRoot, "--run-dir", state.RunDir)
+	if err := tmuxSend(cyclePane, cycleCmd); err != nil {
 		return err
-	}
-
-	reviewWin := prefix + "review"
-	if err := exec.Command("tmux", "new-window", "-t", session, "-n", reviewWin, "-c", state.WorktreePath).Run(); err != nil {
-		return err
-	}
-	reviewPane, err := tmuxPaneID(session + ":" + reviewWin)
-	if err != nil {
-		return err
-	}
-	for i, reviewer := range cfg.Agents.Reviewers {
-		if i > 0 {
-			reviewPane, err = tmuxSplitPane(session+":"+reviewWin, state.WorktreePath)
-			if err != nil {
-				return err
-			}
-		}
-		role := "reviewer-" + slug(reviewer.Name)
-		prompt := filepath.Join(state.RunDir, role+".prompt.md")
-		output := filepath.Join(state.RunDir, role+".log")
-		reviewerCmd := shellJoin(self(), "wait-file", state.ImplementDone) + " && " + shellJoin(self(), "agent", "--repo", state.WorktreePath, "--run-dir", state.RunDir, "--role", role, "--prompt", prompt, "--output", output, "--done", reviewerDone(state, reviewer.Name))
-		if err := tmuxSend(reviewPane, reviewerCmd); err != nil {
-			return err
-		}
-	}
-	if len(cfg.Agents.Reviewers) > 1 {
-		_ = exec.Command("tmux", "select-layout", "-t", session+":"+reviewWin, "tiled").Run()
 	}
 
 	if gate {
@@ -1983,6 +2193,11 @@ Required output:
 - Then a brief conclusion.
 
 Do not edit files during review.
+
+End with exactly one line and nothing after it:
+SIDEKICK_VERDICT: approve
+or
+SIDEKICK_VERDICT: revise
 `, agent.Name, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath, state.MemoryFile)
 }
 
