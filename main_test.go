@@ -102,10 +102,11 @@ func TestExpandPrompt(t *testing.T) {
 		RunDir:       "/runs/run-1",
 		TaskFile:     "/runs/run-1/task.md",
 		PlanFile:     "/runs/run-1/plan.md",
+		MemoryFile:   "/repo/.sidekick/memory.md",
 		WorktreePath: "/worktrees/run-1",
 	}
-	got := expandPrompt("$SIDEKICK_RUN_ID|$SIDEKICK_RUN_DIR|$SIDEKICK_TASK_FILE|$SIDEKICK_PLAN_FILE|$SIDEKICK_WORKTREE|$UNKNOWN", state)
-	want := "run-1|/runs/run-1|/runs/run-1/task.md|/runs/run-1/plan.md|/worktrees/run-1|"
+	got := expandPrompt("$SIDEKICK_RUN_ID|$SIDEKICK_RUN_DIR|$SIDEKICK_TASK_FILE|$SIDEKICK_PLAN_FILE|$SIDEKICK_MEMORY_FILE|$SIDEKICK_WORKTREE|$UNKNOWN", state)
+	want := "run-1|/runs/run-1|/runs/run-1/task.md|/runs/run-1/plan.md|/repo/.sidekick/memory.md|/worktrees/run-1|"
 	if got != want {
 		t.Fatalf("expandPrompt() = %q, want %q", got, want)
 	}
@@ -127,6 +128,25 @@ func TestPromptOverrides(t *testing.T) {
 	reviewer := reviewerPrompt(state, AgentConfig{Name: "custom-reviewer", Prompt: "review $SIDEKICK_WORKTREE"})
 	if reviewer != "review "+state.WorktreePath {
 		t.Fatalf("reviewer override = %q", reviewer)
+	}
+
+	learner := learnPrompt(state, AgentConfig{Prompt: "learn $SIDEKICK_MEMORY_FILE"})
+	if learner != "learn "+state.MemoryFile {
+		t.Fatalf("learner override = %q", learner)
+	}
+}
+
+func TestDefaultPromptsReferenceMemoryFile(t *testing.T) {
+	state := testRunState(t, false)
+	for name, prompt := range map[string]string{
+		"planner":     plannerPrompt(state, AgentConfig{}),
+		"implementer": implementerPrompt(state, AgentConfig{}),
+		"reviewer":    reviewerPrompt(state, AgentConfig{Name: "reviewer"}),
+		"learner":     learnPrompt(state, AgentConfig{}),
+	} {
+		if !strings.Contains(prompt, state.MemoryFile) {
+			t.Fatalf("%s prompt missing memory file %q:\n%s", name, state.MemoryFile, prompt)
+		}
 	}
 }
 
@@ -159,8 +179,22 @@ func TestConfigDefaults(t *testing.T) {
 	if len(cfg.Agents.Reviewers) != 2 {
 		t.Fatalf("reviewer defaults = %d, want 2", len(cfg.Agents.Reviewers))
 	}
+	if cfg.Agents.Learner.Name == "" {
+		t.Fatal("learner default missing")
+	}
 	if !reflect.DeepEqual(cfg.Gate.Command, []string{"no-mistakes", "-y"}) {
 		t.Fatalf("gate command = %#v", cfg.Gate.Command)
+	}
+}
+
+func TestAgentForRoleLearner(t *testing.T) {
+	cfg := (Config{}).withDefaults()
+	agent, err := agentForRole(cfg, "learn")
+	if err != nil {
+		t.Fatalf("agentForRole(learn) error = %v", err)
+	}
+	if agent.Name != cfg.Agents.Learner.Name {
+		t.Fatalf("learner agent = %q, want %q", agent.Name, cfg.Agents.Learner.Name)
 	}
 }
 
@@ -227,6 +261,89 @@ func TestBuildStatusViewRunningAndComplete(t *testing.T) {
 	wantStatuses = []string{"done", "done", "done", "done"}
 	if got := stepStatuses(view.Steps); !reflect.DeepEqual(got, wantStatuses) {
 		t.Fatalf("statuses = %#v, want %#v", got, wantStatuses)
+	}
+}
+
+func TestBuildStatusViewLearnStep(t *testing.T) {
+	state := testRunState(t, false)
+	state.ReviewerNames = nil
+	state.LearnEnabled = true
+	state.LearnDone = filepath.Join(state.RunDir, "learn.done")
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "waiting" {
+		t.Fatalf("learn status = %q, want waiting", got)
+	}
+
+	mustWrite(t, state.PlannerDone, "done\n")
+	mustWrite(t, state.ImplementDone, "done\n")
+	mustWrite(t, learnLog(state), "learning\n")
+	view, err = buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "running" {
+		t.Fatalf("learn status = %q, want running", got)
+	}
+
+	mustWrite(t, state.LearnDone, "done\n")
+	view, err = buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "done" {
+		t.Fatalf("learn status = %q, want done", got)
+	}
+}
+
+func TestBuildStatusViewLearnWaitsForGate(t *testing.T) {
+	state := testRunState(t, true)
+	state.ReviewerNames = nil
+	state.LearnEnabled = true
+	state.LearnDone = filepath.Join(state.RunDir, "learn.done")
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, state.PlannerDone, "done\n")
+	mustWrite(t, state.ImplementDone, "done\n")
+	mustWrite(t, learnLog(state), "learning\n")
+
+	view, err := buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "waiting" {
+		t.Fatalf("learn status before gate = %q, want waiting", got)
+	}
+
+	mustWrite(t, gateDone(state), "done\n")
+	view, err = buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "running" {
+		t.Fatalf("learn status after gate = %q, want running", got)
+	}
+}
+
+func TestBuildStatusViewOmitsLearnWhenDisabled(t *testing.T) {
+	state := testRunState(t, false)
+	state.LearnEnabled = false
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	view, err := buildStatusView(state.RunDir)
+	if err != nil {
+		t.Fatalf("buildStatusView() error = %v", err)
+	}
+	if got := stepStatusByName(view.Steps, "learn"); got != "" {
+		t.Fatalf("learn step present when disabled: %q", got)
 	}
 }
 
@@ -468,13 +585,17 @@ func testRunState(t *testing.T, gate bool) RunState {
 		RunDir:          runDir,
 		TaskFile:        filepath.Join(runDir, "task.md"),
 		PlanFile:        filepath.Join(runDir, "plan.md"),
+		MemoryFile:      filepath.Join(runDir, "repo", ".sidekick", "memory.md"),
 		PlannerDone:     filepath.Join(runDir, "planner.done"),
 		ImplementDone:   filepath.Join(runDir, "implement.done"),
+		LearnDone:       filepath.Join(runDir, "learn.done"),
 		WorktreePath:    filepath.Join(runDir, "worktree"),
 		TmuxSession:     "sidekick-test-run",
 		GateEnabled:     gate,
+		LearnEnabled:    false,
 		PlannerName:     "claude-planner",
 		ImplementerName: "codex-implementer",
+		LearnerName:     "claude-learner",
 		ReviewerNames:   []string{"codex-reviewer"},
 	}
 	mustWrite(t, state.TaskFile, "Ship the dashboard\n\nExtra detail\n")
@@ -490,6 +611,15 @@ func stepStatuses(steps []PipelineStep) []string {
 		statuses = append(statuses, step.Status)
 	}
 	return statuses
+}
+
+func stepStatusByName(steps []PipelineStep, name string) string {
+	for _, step := range steps {
+		if step.Name == name {
+			return step.Status
+		}
+	}
+	return ""
 }
 
 func mustWrite(t *testing.T, path, body string) {

@@ -40,6 +40,7 @@ type AgentsConfig struct {
 	Planner     AgentConfig   `json:"planner"`
 	Implementer AgentConfig   `json:"implementer"`
 	Reviewers   []AgentConfig `json:"reviewers"`
+	Learner     AgentConfig   `json:"learner"`
 }
 
 type AgentConfig struct {
@@ -71,14 +72,18 @@ type RunState struct {
 	RunDir          string    `json:"runDir"`
 	TaskFile        string    `json:"taskFile"`
 	PlanFile        string    `json:"planFile"`
+	MemoryFile      string    `json:"memoryFile"`
 	PlannerDone     string    `json:"plannerDone"`
 	ImplementDone   string    `json:"implementDone"`
+	LearnDone       string    `json:"learnDone"`
 	WorktreePath    string    `json:"worktreePath"`
 	WorktreeBackend string    `json:"worktreeBackend"`
 	TmuxSession     string    `json:"tmuxSession"`
 	GateEnabled     bool      `json:"gateEnabled"`
+	LearnEnabled    bool      `json:"learnEnabled"`
 	PlannerName     string    `json:"plannerName"`
 	ImplementerName string    `json:"implementerName"`
+	LearnerName     string    `json:"learnerName"`
 	ReviewerNames   []string  `json:"reviewerNames"`
 }
 
@@ -136,9 +141,9 @@ func usageText() string {
 sidekick orchestrates planner, implementer, and reviewer agent harnesses.
 
 Usage:
-  sidekick [--repo PATH] [--gate] [--no-land] [--no-attach]
-  sidekick run [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-land] [--no-attach]
-  sidekick console [--repo PATH] [--gate] [--no-land]
+  sidekick [--repo PATH] [--gate] [--no-learn] [--no-land] [--no-attach]
+  sidekick run [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-learn] [--no-land] [--no-attach]
+  sidekick console [--repo PATH] [--gate] [--no-learn] [--no-land]
   sidekick status --run-dir PATH [--watch] [--interval 2s]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
@@ -201,6 +206,7 @@ func startRun(args []string) error {
 	planner := fs.String("planner", "", "planner agent name from config")
 	implementer := fs.String("implementer", "", "implementer agent name from config")
 	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLearn := fs.Bool("no-learn", false, "do not run the post-implementation learner that updates .sidekick/memory.md")
 	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
 	noAttach := fs.Bool("no-attach", false, "do not attach to the tmux session after creating it")
 	if err := fs.Parse(args); err != nil {
@@ -243,7 +249,7 @@ func startRun(args []string) error {
 	}
 
 	gateEnabled := *gate || cfg.Gate.Enabled
-	if err := validateAgents(cfg, gateEnabled); err != nil {
+	if err := validateAgents(cfg, gateEnabled, !*noLearn); err != nil {
 		return err
 	}
 
@@ -254,7 +260,7 @@ func startRun(args []string) error {
 		return err
 	}
 
-	state, err := spawnRun(session, "", root, cfg, taskText, gateEnabled, !*noLand)
+	state, err := spawnRun(session, "", root, cfg, taskText, gateEnabled, !*noLearn, !*noLand)
 	if err != nil {
 		return err
 	}
@@ -275,8 +281,8 @@ func startRun(args []string) error {
 }
 
 // validateAgents checks that tmux, the gate command (when enabled), and every
-// configured agent are runnable before any run is spawned.
-func validateAgents(cfg Config, gateEnabled bool) error {
+// configured agent needed by this run are runnable before any run is spawned.
+func validateAgents(cfg Config, gateEnabled, learnEnabled bool) error {
 	if err := requireBinary("tmux"); err != nil {
 		return err
 	}
@@ -285,7 +291,12 @@ func validateAgents(cfg Config, gateEnabled bool) error {
 			return fmt.Errorf("gate: %w", err)
 		}
 	}
-	for _, agent := range cfg.AllAgents() {
+	agents := []AgentConfig{cfg.Agents.Planner, cfg.Agents.Implementer}
+	agents = append(agents, cfg.Agents.Reviewers...)
+	if learnEnabled {
+		agents = append(agents, cfg.Agents.Learner)
+	}
+	for _, agent := range agents {
 		if err := requireAgent(agent); err != nil {
 			return err
 		}
@@ -301,6 +312,7 @@ func startConsole(args []string) error {
 	fs := flag.NewFlagSet("console-launcher", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "target repository")
 	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLearn := fs.Bool("no-learn", false, "do not run the post-implementation learner that updates .sidekick/memory.md")
 	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
 	noAttach := fs.Bool("no-attach", false, "do not attach to the tmux session after creating it")
 	if err := fs.Parse(args); err != nil {
@@ -319,7 +331,7 @@ func startConsole(args []string) error {
 		return errors.New("at least one reviewer agent is required")
 	}
 	gateEnabled := *gate || cfg.Gate.Enabled
-	if err := validateAgents(cfg, gateEnabled); err != nil {
+	if err := validateAgents(cfg, gateEnabled, !*noLearn); err != nil {
 		return err
 	}
 
@@ -328,6 +340,9 @@ func startConsole(args []string) error {
 	consoleArgs := []string{self(), "console", "--repo", root}
 	if gateEnabled {
 		consoleArgs = append(consoleArgs, "--gate")
+	}
+	if *noLearn {
+		consoleArgs = append(consoleArgs, "--no-learn")
 	}
 	if *noLand {
 		consoleArgs = append(consoleArgs, "--no-land")
@@ -360,6 +375,7 @@ func consoleLoop(args []string) error {
 	fs := flag.NewFlagSet("console", flag.ContinueOnError)
 	repo := fs.String("repo", ".", "target repository")
 	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
+	noLearn := fs.Bool("no-learn", false, "do not run the post-implementation learner that updates .sidekick/memory.md")
 	noLand := fs.Bool("no-land", false, "do not add the land window that commits/pushes/opens a PR")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -377,7 +393,7 @@ func consoleLoop(args []string) error {
 		return errors.New("at least one reviewer agent is required")
 	}
 	gateEnabled := *gate || cfg.Gate.Enabled
-	if err := validateAgents(cfg, gateEnabled); err != nil {
+	if err := validateAgents(cfg, gateEnabled, !*noLearn); err != nil {
 		return err
 	}
 
@@ -388,6 +404,7 @@ func consoleLoop(args []string) error {
 	session := strings.TrimSpace(string(sessionOut))
 
 	land := !*noLand
+	learn := !*noLearn
 	in := bufio.NewReader(os.Stdin)
 	for idx := 1; ; idx++ {
 		fmt.Print(mascotColored())
@@ -411,7 +428,7 @@ func consoleLoop(args []string) error {
 		}
 
 		prefix := fmt.Sprintf("t%d-", idx)
-		state, err := spawnRun(session, prefix, root, cfg, taskText, gateEnabled, land)
+		state, err := spawnRun(session, prefix, root, cfg, taskText, gateEnabled, learn, land)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "sidekick: %v\n", err)
 			idx--
@@ -543,6 +560,7 @@ func runAgent(args []string) error {
 		"SIDEKICK_RUN_DIR="+state.RunDir,
 		"SIDEKICK_TASK_FILE="+state.TaskFile,
 		"SIDEKICK_PLAN_FILE="+state.PlanFile,
+		"SIDEKICK_MEMORY_FILE="+state.MemoryFile,
 		"SIDEKICK_WORKTREE="+state.WorktreePath,
 	)
 
@@ -676,6 +694,7 @@ func runGate(args []string) error {
 		"SIDEKICK_RUN_DIR="+state.RunDir,
 		"SIDEKICK_TASK_FILE="+state.TaskFile,
 		"SIDEKICK_PLAN_FILE="+state.PlanFile,
+		"SIDEKICK_MEMORY_FILE="+state.MemoryFile,
 		"SIDEKICK_WORKTREE="+state.WorktreePath,
 	)
 	cmd.Stdout = io.MultiWriter(os.Stdout, out)
@@ -732,6 +751,11 @@ func defaultConfig() Config {
 				{Name: "codex-reviewer", Command: []string{"codex", "exec"}, PromptMode: "stdin"},
 				{Name: "claude-reviewer", Command: []string{"claude"}, PromptMode: "stdin"},
 			},
+			Learner: AgentConfig{
+				Name:       "claude-learner",
+				Command:    []string{"claude"},
+				PromptMode: "stdin",
+			},
 		},
 		Gate: GateConfig{
 			Enabled: false,
@@ -768,6 +792,9 @@ func (cfg Config) withDefaults() Config {
 	if len(cfg.Agents.Reviewers) == 0 {
 		cfg.Agents.Reviewers = def.Agents.Reviewers
 	}
+	if cfg.Agents.Learner.Name == "" {
+		cfg.Agents.Learner = def.Agents.Learner
+	}
 	if len(cfg.Gate.Command) == 0 {
 		cfg.Gate.Command = def.Gate.Command
 	}
@@ -777,6 +804,7 @@ func (cfg Config) withDefaults() Config {
 func (cfg Config) AllAgents() []AgentConfig {
 	agents := []AgentConfig{cfg.Agents.Planner, cfg.Agents.Implementer}
 	agents = append(agents, cfg.Agents.Reviewers...)
+	agents = append(agents, cfg.Agents.Learner)
 	return agents
 }
 
@@ -814,6 +842,9 @@ func agentForRole(cfg Config, role string) (AgentConfig, error) {
 	}
 	if role == "implementer" {
 		return normalizeAgent(cfg.Agents.Implementer), nil
+	}
+	if role == "learn" {
+		return normalizeAgent(cfg.Agents.Learner), nil
 	}
 	for _, reviewer := range cfg.Agents.Reviewers {
 		if role == "reviewer-"+slug(reviewer.Name) {
@@ -1065,6 +1096,10 @@ func writeRunFiles(state RunState, task string, cfg Config) error {
 		filepath.Join(state.RunDir, "planner.prompt.md"):     plannerPrompt(state, planner),
 		filepath.Join(state.RunDir, "implementer.prompt.md"): implementerPrompt(state, implementer),
 	}
+	if state.LearnEnabled {
+		learner := agentConfigByName(cfg.AllAgents(), state.LearnerName, cfg.Agents.Learner)
+		files[filepath.Join(state.RunDir, "learn.prompt.md")] = learnPrompt(state, learner)
+	}
 	for _, reviewer := range state.ReviewerNames {
 		agent := agentConfigByName(cfg.Agents.Reviewers, reviewer, AgentConfig{Name: reviewer})
 		files[filepath.Join(state.RunDir, "reviewer-"+slug(reviewer)+".prompt.md")] = reviewerPrompt(state, agent)
@@ -1167,6 +1202,14 @@ func buildStatusView(runDir string) (StatusView, error) {
 	if state.GateEnabled {
 		log := gateLog(state)
 		view.Steps = append(view.Steps, PipelineStep{Name: "gate", Status: gatedStepStatus(state.ImplementDone, gateDone(state), log), Log: log})
+	}
+	if state.LearnEnabled {
+		log := learnLog(state)
+		prerequisite := state.ImplementDone
+		if state.GateEnabled {
+			prerequisite = gateDone(state)
+		}
+		view.Steps = append(view.Steps, PipelineStep{Name: "learn", Status: gatedStepStatus(prerequisite, state.LearnDone, log), Log: log})
 	}
 	view.Phase = currentPhase(view.Steps)
 	view.RecentTitle, view.RecentLines = recentOutput(view.Steps)
@@ -1340,6 +1383,10 @@ func gateDone(state RunState) string {
 	return filepath.Join(state.RunDir, "gate.done")
 }
 
+func learnLog(state RunState) string {
+	return filepath.Join(state.RunDir, "learn.log")
+}
+
 func markFile(path string) error {
 	return os.WriteFile(path, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644)
 }
@@ -1435,14 +1482,14 @@ func loadState(runDir string) (RunState, error) {
 }
 
 // addRunWindows adds one run's windows (planner, dashboard, implement, review,
-// optional gate, optional land) to an existing tmux session, with every window
+// optional gate, optional learn, optional land) to an existing tmux session, with every window
 // name prefixed so multiple runs can coexist in the same session. It expects
 // the session (or an empty placeholder window) to already exist and creates
 // its own prefix+"planner" window rather than reusing whatever window is
 // current, so it is safe to call into a session that already hosts other
 // runs. It does not create the session and does not select a window -
 // callers that own the session decide that.
-func addRunWindows(session, prefix string, cfg Config, state RunState, gate, land bool) error {
+func addRunWindows(session, prefix string, cfg Config, state RunState, gate, learn, land bool) error {
 	plannerWin := prefix + "planner"
 	if err := exec.Command("tmux", "new-window", "-t", session, "-n", plannerWin, "-c", state.RepoRoot).Run(); err != nil {
 		return fmt.Errorf("create planner window: %w", err)
@@ -1524,6 +1571,25 @@ func addRunWindows(session, prefix string, cfg Config, state RunState, gate, lan
 		}
 	}
 
+	if learn {
+		learnWin := prefix + "learn"
+		if err := exec.Command("tmux", "new-window", "-t", session, "-n", learnWin, "-c", state.RepoRoot).Run(); err != nil {
+			return err
+		}
+		learnPane, err := tmuxPaneID(session + ":" + learnWin)
+		if err != nil {
+			return err
+		}
+		learnCmd := shellJoin(self(), "wait-file", state.ImplementDone)
+		if gate {
+			learnCmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
+		}
+		learnCmd += " && " + shellJoin(self(), "agent", "--repo", state.RepoRoot, "--run-dir", state.RunDir, "--role", "learn", "--prompt", filepath.Join(state.RunDir, "learn.prompt.md"), "--output", learnLog(state), "--done", state.LearnDone)
+		if err := tmuxSend(learnPane, learnCmd); err != nil {
+			return err
+		}
+	}
+
 	if land {
 		landWin := prefix + "land"
 		if err := exec.Command("tmux", "new-window", "-t", session, "-n", landWin, "-c", state.WorktreePath).Run(); err != nil {
@@ -1533,10 +1599,13 @@ func addRunWindows(session, prefix string, cfg Config, state RunState, gate, lan
 		if err != nil {
 			return err
 		}
-		// wait for implementation (and the gate, when enabled) before landing
+		// wait for implementation, the gate, and repo learning before landing
 		landCmd := shellJoin(self(), "wait-file", state.ImplementDone)
 		if gate {
 			landCmd += " && " + shellJoin(self(), "wait-file", gateDone(state))
+		}
+		if learn {
+			landCmd += " && " + shellJoin(self(), "wait-file", state.LearnDone)
 		}
 		landCmd += " && " + shellJoin(self(), "land", "--repo", state.WorktreePath, "--run-dir", state.RunDir)
 		if err := tmuxSend(landPane, landCmd); err != nil {
@@ -1561,9 +1630,13 @@ func newBootstrapSession(session, root string) (string, error) {
 // spawnRun leases a worktree, writes run files and state, and adds the run's
 // windows to an existing tmux session under the given window-name prefix. It
 // does not create the session and does not attach; the caller decides that.
-func spawnRun(session, prefix, root string, cfg Config, task string, gate, land bool) (RunState, error) {
+func spawnRun(session, prefix, root string, cfg Config, task string, gate, learn, land bool) (RunState, error) {
 	runID, runDir, err := uniqueRunDir(root, task)
 	if err != nil {
+		return RunState{}, err
+	}
+	memoryFile := filepath.Join(root, ".sidekick", "memory.md")
+	if err := os.MkdirAll(filepath.Dir(memoryFile), 0o755); err != nil {
 		return RunState{}, err
 	}
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -1577,6 +1650,7 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, land 
 
 	plannerAgent := normalizeAgent(cfg.Agents.Planner)
 	implementerAgent := normalizeAgent(cfg.Agents.Implementer)
+	learnerAgent := normalizeAgent(cfg.Agents.Learner)
 
 	state := RunState{
 		ID:              runID,
@@ -1585,14 +1659,18 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, land 
 		RunDir:          runDir,
 		TaskFile:        filepath.Join(runDir, "task.md"),
 		PlanFile:        filepath.Join(runDir, "plan.md"),
+		MemoryFile:      memoryFile,
 		PlannerDone:     filepath.Join(runDir, "planner.done"),
 		ImplementDone:   filepath.Join(runDir, "implement.done"),
+		LearnDone:       filepath.Join(runDir, "learn.done"),
 		WorktreePath:    worktree,
 		WorktreeBackend: backend,
 		TmuxSession:     session,
 		GateEnabled:     gate,
+		LearnEnabled:    learn,
 		PlannerName:     plannerAgent.Name,
 		ImplementerName: implementerAgent.Name,
+		LearnerName:     learnerAgent.Name,
 	}
 	for _, reviewer := range cfg.Agents.Reviewers {
 		state.ReviewerNames = append(state.ReviewerNames, reviewer.Name)
@@ -1604,7 +1682,7 @@ func spawnRun(session, prefix, root string, cfg Config, task string, gate, land 
 	if err := writeState(state); err != nil {
 		return RunState{}, err
 	}
-	if err := addRunWindows(session, prefix, cfg, state, gate, land); err != nil {
+	if err := addRunWindows(session, prefix, cfg, state, gate, learn, land); err != nil {
 		return RunState{}, err
 	}
 	return state, nil
@@ -1685,7 +1763,7 @@ func agentStdin(agent AgentConfig, prompt []byte) io.Reader {
 }
 
 func workDirForRole(state RunState, role string) string {
-	if role == "planner" {
+	if role == "planner" || role == "learn" {
 		return state.RepoRoot
 	}
 	return state.WorktreePath
@@ -1702,6 +1780,8 @@ func expandPrompt(tmpl string, state RunState) string {
 			return state.TaskFile
 		case "SIDEKICK_PLAN_FILE":
 			return state.PlanFile
+		case "SIDEKICK_MEMORY_FILE":
+			return state.MemoryFile
 		case "SIDEKICK_WORKTREE":
 			return state.WorktreePath
 		default:
@@ -1722,6 +1802,10 @@ with the human. Discuss and refine the plan with them until they are satisfied.
 Read the task in:
 %s
 
+Prior Sidekick runs recorded lessons for this repo at:
+%s
+If it exists, read it first for context and known pitfalls.
+
 Produce a concrete, reachable implementation plan an implementation agent can
 execute without further human back-and-forth:
 - Goal statement.
@@ -1737,7 +1821,7 @@ $SIDEKICK_PLAN_FILE):
 Do not edit any other files -- write only the plan file. When the plan file is
 saved and the human is done, end the session; Sidekick will ask them to release
 the implementer.
-`, state.ID, state.TaskFile, state.PlanFile)
+`, state.ID, state.TaskFile, state.MemoryFile, state.PlanFile)
 }
 
 func implementerPrompt(state RunState, agent AgentConfig) string {
@@ -1754,6 +1838,10 @@ Task file:
 Plan file:
 %s
 
+Prior Sidekick runs recorded lessons for this repo at:
+%s
+If it exists, read it first for context and known pitfalls.
+
 Work in this isolated worktree:
 %s
 
@@ -1763,7 +1851,7 @@ Execute the plan with the smallest correct change. Keep the worktree reviewable:
 - Run relevant validation.
 - Do not commit unless the task explicitly requires it.
 - Write a concise outcome summary to stdout, including validation results.
-`, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath)
+`, state.ID, state.TaskFile, state.PlanFile, state.MemoryFile, state.WorktreePath)
 }
 
 func reviewerPrompt(state RunState, agent AgentConfig) string {
@@ -1783,6 +1871,10 @@ Plan file:
 Review the git changes in this worktree:
 %s
 
+Prior Sidekick runs recorded lessons for this repo at:
+%s
+If it exists, read it first for context and known pitfalls.
+
 Use a code-review stance. Prioritize bugs, regressions, security issues, missing tests, and mismatches with the task or plan.
 
 Required output:
@@ -1791,7 +1883,44 @@ Required output:
 - Then a brief conclusion.
 
 Do not edit files during review.
-`, agent.Name, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath)
+`, agent.Name, state.ID, state.TaskFile, state.PlanFile, state.WorktreePath, state.MemoryFile)
+}
+
+func learnPrompt(state RunState, agent AgentConfig) string {
+	if strings.TrimSpace(agent.Prompt) != "" {
+		return expandPrompt(agent.Prompt, state)
+	}
+	return fmt.Sprintf(`# Sidekick repo learning task
+
+You are the learning agent for Sidekick run %s.
+
+Update this repo memory file only:
+%s
+
+Read these run inputs and outputs:
+- Task file: %s
+- Plan file: %s
+- Implementer log: %s
+- Worktree status: git -C %s status --short
+- Worktree diff: git -C %s diff
+
+Create the memory file if it does not exist. Keep it as Markdown with these sections:
+
+## Repo insights
+
+Durable, generally useful conventions, skills, pitfalls, commands, architecture notes, and validation facts for future Sidekick runs in this repo. Merge new insights into this section, edit existing bullets in place when needed, keep it concise, and avoid duplicates.
+
+## Runs
+
+Append a dated entry for this run. Include:
+- Run id: %s
+- Goal from the task
+- Files touched, based on git status/diff
+- Validation outcome from the implementer log or diff context
+- Any follow-up risk worth remembering
+
+Do not edit any file except the memory file. If there is no durable insight, still append the run entry and leave Repo insights concise.
+`, state.ID, state.MemoryFile, state.TaskFile, state.PlanFile, implementerLog(state), state.WorktreePath, state.WorktreePath, state.ID)
 }
 
 func gatePrompt(state RunState) string {
