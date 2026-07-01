@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -603,6 +604,128 @@ func TestUniqueRunDirDistinctOnCollision(t *testing.T) {
 	}
 	if !strings.HasSuffix(id3, "-3") {
 		t.Fatalf("id3 = %q, want suffix -3", id3)
+	}
+}
+
+func TestStageCommands(t *testing.T) {
+	state := testRunState(t, true)
+	cfg := defaultConfig()
+	stages := stageCommands(cfg, state, true, true, true)
+	var names []string
+	interactive := map[string]bool{}
+	for _, stage := range stages {
+		names = append(names, stage.Name)
+		interactive[stage.Name] = stage.Interactive
+	}
+	want := []string{"planner", "implement", "review-codex-reviewer", "review-claude-reviewer", "gate", "learn", "land"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("stage names = %#v, want %#v", names, want)
+	}
+	if !interactive["planner"] {
+		t.Fatal("planner stage should be interactive")
+	}
+	for _, name := range names[1:] {
+		if interactive[name] {
+			t.Fatalf("%s stage should be headless", name)
+		}
+	}
+
+	stages = stageCommands(cfg, state, false, false, false)
+	names = nil
+	for _, stage := range stages {
+		names = append(names, stage.Name)
+	}
+	want = []string{"planner", "implement", "review-codex-reviewer", "review-claude-reviewer"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("minimal stage names = %#v, want %#v", names, want)
+	}
+}
+
+func TestParseConsoleInput(t *testing.T) {
+	cases := []struct {
+		line string
+		want consoleInput
+	}{
+		{"build the thing", consoleInput{Kind: "task", Task: "build the thing"}},
+		{"/release t2", consoleInput{Kind: "command", Command: "release", Args: []string{"t2"}}},
+		{"/ship", consoleInput{Kind: "command", Command: "ship"}},
+		{"/help", consoleInput{Kind: "command", Command: "help"}},
+		{"/foo", consoleInput{Kind: "command", Command: "foo"}},
+		{"quit", consoleInput{Kind: "exit"}},
+	}
+	for _, tc := range cases {
+		if got := parseConsoleInput(tc.line); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("parseConsoleInput(%q) = %#v, want %#v", tc.line, got, tc.want)
+		}
+	}
+}
+
+func TestRenderAllStatusCapsRuns(t *testing.T) {
+	root := t.TempDir()
+	for i := 1; i <= 10; i++ {
+		runDir := filepath.Join(root, runRoot, fmt.Sprintf("run-%02d", i))
+		if err := os.MkdirAll(runDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		state := RunState{
+			ID:            fmt.Sprintf("run-%02d", i),
+			ConsoleLabel:  fmt.Sprintf("t%d", i),
+			CreatedAt:     time.Now().Add(time.Duration(i) * time.Minute),
+			RepoRoot:      root,
+			RunDir:        runDir,
+			TaskFile:      filepath.Join(runDir, "task.md"),
+			PlanFile:      filepath.Join(runDir, "plan.md"),
+			PlannerDone:   filepath.Join(runDir, "planner.done"),
+			ImplementDone: filepath.Join(runDir, "implement.done"),
+			WorktreePath:  filepath.Join(runDir, "worktree"),
+			TmuxSession:   "sidekick-test",
+		}
+		mustWrite(t, state.TaskFile, fmt.Sprintf("Task %02d\n", i))
+		if err := writeState(state); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := renderAllStatus(&out, root, 100); err != nil {
+		t.Fatalf("renderAllStatus() error = %v", err)
+	}
+	text := out.String()
+	for _, want := range []string{"t10", "Task 10", "+2 more"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("aggregate status missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "t1 ") {
+		t.Fatalf("aggregate status did not cap oldest run:\n%s", text)
+	}
+}
+
+func TestShipRunWritesApproval(t *testing.T) {
+	state := testRunState(t, false)
+	state.LandEnabled = true
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, landReady(state), "ready\n")
+
+	if err := shipRun([]string{"--run-dir", state.RunDir}); err != nil {
+		t.Fatalf("shipRun() error = %v", err)
+	}
+	if !fileExists(landApprove(state)) {
+		t.Fatal("land.approve not written")
+	}
+}
+
+func TestPlanSummaryUsesGoalSection(t *testing.T) {
+	state := testRunState(t, false)
+	mustWrite(t, state.PlanFile, "# Plan\n\n## Goal\n\nShip a fixed console dashboard. It should stay compact.\n\n## Steps\n\n- one\n")
+	title, body := planSummary(state.PlanFile, state.TaskFile, state.ID)
+	if title != "Ship a fixed console dashboard." {
+		t.Fatalf("title = %q", title)
+	}
+	if !strings.Contains(body, "Ship a fixed console dashboard") || !strings.Contains(body, "Plan: .sidekick/runs/test-run/plan.md") {
+		t.Fatalf("body = %q", body)
 	}
 }
 
