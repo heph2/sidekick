@@ -8,6 +8,7 @@ It keeps the human in one conversation while coordinating the noisy parts:
 - implementation in an isolated worktree (Treehouse when available, otherwise a plain git worktree)
 - review by multiple harnesses
 - optional `no-mistakes` gating after implementation
+- repo-local memory that records what happened and durable lessons for future runs
 - one tmux workspace with a live dashboard for visibility without constant pane switching
 
 ## Current shape
@@ -21,10 +22,13 @@ The default flow is:
    implementer before anything else starts
 2. implementer waits for your approval, then works autonomously in an isolated worktree
 3. reviewers wait for implementation to finish, then review the git diff
-4. the dashboard window tracks goal, phase, artifacts, and recent output (with color on a TTY)
-5. optional gate window runs `no-mistakes -y`
-6. land window commits the worktree, then prompts before pushing the branch and
-   opening a PR via `gh` (skip with `--no-land`)
+4. learner waits for implementation, then updates `.sidekick/memory.md` with a
+   run entry and concise repo insights (skip with `--no-learn`)
+5. the dashboard window tracks goal, phase, artifacts, and recent output (with color on a TTY)
+6. optional gate window runs `no-mistakes -y`; when enabled, learner and land wait for it
+7. land window commits the worktree, then prompts before pushing the branch and
+   opening a PR via `gh`; when learning is enabled, land waits for it first so
+   the learner can inspect the uncommitted diff (skip with `--no-land`)
 
 ## Requirements
 
@@ -70,6 +74,12 @@ With the gate, and without auto-attaching:
 sidekick --task "Implement the requested feature and validate it" --gate --no-attach
 ```
 
+Skip the post-run learner for a one-off run:
+
+```sh
+sidekick --task "Try an experiment" --no-learn
+```
+
 Render a run dashboard without attaching to tmux:
 
 ```sh
@@ -113,7 +123,12 @@ Default config:
         "command": ["claude"],
         "promptMode": "stdin"
       }
-    ]
+    ],
+    "learner": {
+      "name": "claude-learner",
+      "command": ["claude"],
+      "promptMode": "stdin"
+    }
   },
   "gate": {
     "enabled": false,
@@ -155,10 +170,16 @@ harness needs more complex model selection, keep using `command` directly.
 }
 ```
 
-Each planner, implementer, or reviewer can also set `prompt` to replace the
-built-in initial prompt. Sidekick expands `$SIDEKICK_RUN_ID`,
-`$SIDEKICK_RUN_DIR`, `$SIDEKICK_TASK_FILE`, `$SIDEKICK_PLAN_FILE`, and
-`$SIDEKICK_WORKTREE` in custom prompts.
+Each planner, implementer, reviewer, or learner can also set `prompt` to replace
+the built-in initial prompt. Sidekick expands `$SIDEKICK_RUN_ID`,
+`$SIDEKICK_RUN_DIR`, `$SIDEKICK_TASK_FILE`, `$SIDEKICK_PLAN_FILE`,
+`$SIDEKICK_MEMORY_FILE`, and `$SIDEKICK_WORKTREE` in custom prompts.
+
+The learner defaults to a non-interactive `claude` invocation. It runs from the
+real repo root, reads the run files and worktree diff, and updates only
+`.sidekick/memory.md`. Planner, implementer, and reviewer prompts tell agents to
+read that file first when it exists, so durable repo conventions and pitfalls are
+carried into future runs. Use `--no-learn` to skip this for a run.
 
 `notify` controls attention signals. The terminal bell is enabled by default;
 set `"noBell": true` to silence it. `notify.command` is optional and receives
@@ -184,7 +205,8 @@ treehouse return /path/to/leased/worktree
 When `treehouse` is absent, Sidekick creates a git worktree under
 `.sidekick/worktrees/<id>` on a `sidekick/<run-id>` branch.
 
-The run state and logs live under `.sidekick/runs/<id>/`. Tear down finished
+The run state and logs live under `.sidekick/runs/<id>/`. Persistent repo memory
+lives at `.sidekick/memory.md` and is not removed by cleanup. Tear down finished
 runs (git worktrees, their branches, the run's tmux session, and the run dir)
 with:
 
