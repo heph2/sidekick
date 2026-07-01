@@ -5,7 +5,7 @@ Sidekick is a local orchestration CLI for agentic development loops.
 It keeps the human in one conversation while coordinating the noisy parts:
 
 - planning with a dedicated AI harness
-- implementation in an isolated Treehouse worktree
+- implementation in an isolated worktree (Treehouse when available, otherwise a plain git worktree)
 - review by multiple harnesses
 - optional `no-mistakes` gating after implementation
 - one tmux workspace with a live dashboard for visibility without constant pane switching
@@ -16,19 +16,24 @@ This is the first executable slice. Sidekick does not replace `claude`, `cc`, `c
 
 The default flow is:
 
-1. planner runs in the target repo and writes `.sidekick/runs/<id>/plan.md`
-2. implementer waits for the plan, then works in a leased Treehouse worktree
+1. planner runs as an interactive chat in the target repo; you refine the plan,
+   it writes `.sidekick/runs/<id>/plan.md`, and Sidekick asks you to release the
+   implementer before anything else starts
+2. implementer waits for your approval, then works autonomously in an isolated worktree
 3. reviewers wait for implementation to finish, then review the git diff
-4. the dashboard window tracks goal, phase, artifacts, and recent output
+4. the dashboard window tracks goal, phase, artifacts, and recent output (with color on a TTY)
 5. optional gate window runs `no-mistakes -y`
+6. land window commits the worktree, then prompts before pushing the branch and
+   opening a PR via `gh` (skip with `--no-land`)
 
 ## Requirements
 
 - `git`
 - `go`
 - `tmux`
-- `treehouse`
 - the configured agent CLIs, for example `claude`, `cc`, or `codex`
+- optional: `gh` (to open the PR in the land step; without it, push and open the PR by hand)
+- optional: `treehouse` (falls back to a plain git worktree when absent)
 - optional: `no-mistakes`
 
 ## Usage
@@ -39,24 +44,30 @@ Build:
 go build -o bin/sidekick .
 ```
 
-Initialize config in a target project:
+Start a run from inside any git repo. With no arguments, Sidekick prompts for
+the task, leases a worktree, and attaches to the dashboard:
 
 ```sh
-bin/sidekick init --repo /path/to/project
+cd /path/to/project
+sidekick
 ```
 
-Edit `/path/to/project/.sidekick/config.json` so each agent command matches your local harness setup.
+No `init` step is required: Sidekick uses built-in defaults when
+`.sidekick/config.json` is absent, and falls back to a plain git worktree when
+`treehouse` is not installed. Run `sidekick init` only if you want to customize
+the agent commands (see Config below).
 
-Start a run:
+Pass the task inline, or pipe it in, instead of the prompt:
 
 ```sh
-bin/sidekick run --repo /path/to/project --task "Implement the requested feature and validate it" --attach
+sidekick --task "Implement the requested feature and validate it"
+echo "Implement the requested feature and validate it" | sidekick --no-attach
 ```
 
-With the gate:
+With the gate, and without auto-attaching:
 
 ```sh
-bin/sidekick run --repo /path/to/project --task "Implement the requested feature and validate it" --gate --attach
+sidekick --task "Implement the requested feature and validate it" --gate --no-attach
 ```
 
 Render a run dashboard without attaching to tmux:
@@ -83,11 +94,12 @@ Default config:
     "planner": {
       "name": "claude-planner",
       "command": ["claude"],
-      "promptMode": "stdin"
+      "promptMode": "arg",
+      "interactive": true
     },
     "implementer": {
       "name": "codex-implementer",
-      "command": ["codex"],
+      "command": ["codex", "exec", "--sandbox", "workspace-write"],
       "promptMode": "stdin"
     },
     "reviewers": [
@@ -106,6 +118,10 @@ Default config:
   "gate": {
     "enabled": false,
     "command": ["no-mistakes", "-y"]
+  },
+  "notify": {
+    "noBell": false,
+    "command": []
   }
 }
 ```
@@ -126,16 +142,56 @@ Use `command` to add local model and approval flags, for example:
 }
 ```
 
+Or set `model` on an agent. Sidekick appends `--model <value>` before the
+prompt by default; set `modelFlag` when a harness uses a different flag. If a
+harness needs more complex model selection, keep using `command` directly.
+
+```json
+{
+  "name": "codex-implementer",
+  "command": ["codex", "exec", "--sandbox", "workspace-write"],
+  "promptMode": "stdin",
+  "model": "gpt-5-codex"
+}
+```
+
+Each planner, implementer, or reviewer can also set `prompt` to replace the
+built-in initial prompt. Sidekick expands `$SIDEKICK_RUN_ID`,
+`$SIDEKICK_RUN_DIR`, `$SIDEKICK_TASK_FILE`, `$SIDEKICK_PLAN_FILE`, and
+`$SIDEKICK_WORKTREE` in custom prompts.
+
+`notify` controls attention signals. The terminal bell is enabled by default;
+set `"noBell": true` to silence it. `notify.command` is optional and receives
+the Sidekick message as its final argument, for example:
+
+```json
+{
+  "notify": {
+    "command": ["notify-send", "Sidekick"]
+  }
+}
+```
+
 ## Notes
 
-Sidekick creates durable Treehouse leases with holder names like `sidekick:<run-id>`.
-Return a leased worktree when done:
+When `treehouse` is available, Sidekick creates durable leases with holder names
+like `sidekick:<run-id>`. Return a leased worktree when done:
 
 ```sh
 treehouse return /path/to/leased/worktree
 ```
 
-The run state and logs live under `.sidekick/runs/<id>/`.
+When `treehouse` is absent, Sidekick creates a git worktree under
+`.sidekick/worktrees/<id>` on a `sidekick/<run-id>` branch.
+
+The run state and logs live under `.sidekick/runs/<id>/`. Tear down finished
+runs (git worktrees, their branches, the run's tmux session, and the run dir)
+with:
+
+```sh
+sidekick clean            # all runs
+sidekick clean --run <id> # one run
+```
 
 ## Agent Notes
 
