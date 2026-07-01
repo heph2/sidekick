@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,7 @@ type RunState struct {
 	PlannerDone     string    `json:"plannerDone"`
 	ImplementDone   string    `json:"implementDone"`
 	WorktreePath    string    `json:"worktreePath"`
+	WorktreeBackend string    `json:"worktreeBackend"`
 	TmuxSession     string    `json:"tmuxSession"`
 	GateEnabled     bool      `json:"gateEnabled"`
 	PlannerName     string    `json:"plannerName"`
@@ -69,7 +71,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) < 2 {
-		return usage()
+		return startRun(nil)
 	}
 
 	switch args[1] {
@@ -85,9 +87,16 @@ func run(args []string) error {
 		return runGate(args[2:])
 	case "wait-file":
 		return waitFile(args[2:])
+	case "clean":
+		return cleanRuns(args[2:])
 	case "help", "-h", "--help":
 		return usage()
 	default:
+		// ponytail: bare flags (e.g. `sidekick --no-attach`) mean the hero
+		// path, not a subcommand. Anything else is a typo'd command.
+		if strings.HasPrefix(args[1], "-") {
+			return startRun(args[1:])
+		}
 		return fmt.Errorf("unknown command %q\n\n%s", args[1], usageText())
 	}
 }
@@ -103,16 +112,20 @@ func usageText() string {
 sidekick orchestrates planner, implementer, and reviewer agent harnesses.
 
 Usage:
-  sidekick init [--repo PATH]
-  sidekick run --task TEXT [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--attach]
+  sidekick [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-attach]
   sidekick status --run-dir PATH [--watch] [--interval 2s]
+  sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
   sidekick wait-file FILE
+  sidekick clean [--repo PATH] [--run ID]
 
 Typical flow:
-  sidekick init --repo /path/to/project
-  sidekick run --repo /path/to/project --task "Add X and validate it" --attach
+  cd /path/to/project
+  sidekick          # prompts for the task, leases a worktree, attaches
+
+No config or treehouse setup is required: sidekick uses built-in defaults and
+falls back to a plain git worktree when treehouse is unavailable.
 `
 }
 
@@ -160,12 +173,21 @@ func startRun(args []string) error {
 	planner := fs.String("planner", "", "planner agent name from config")
 	implementer := fs.String("implementer", "", "implementer agent name from config")
 	gate := fs.Bool("gate", false, "run the configured no-mistakes gate after implementation")
-	attach := fs.Bool("attach", false, "attach to the tmux session after creating it")
+	noAttach := fs.Bool("no-attach", false, "do not attach to the tmux session after creating it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*task) == "" {
-		return errors.New("--task is required")
+
+	taskText := strings.TrimSpace(*task)
+	if taskText == "" {
+		got, err := readTask()
+		if err != nil {
+			return err
+		}
+		taskText = got
+	}
+	if taskText == "" {
+		return errors.New("task is required")
 	}
 
 	root, err := repoRoot(*repo)
@@ -192,9 +214,6 @@ func startRun(args []string) error {
 	if err := requireBinary("tmux"); err != nil {
 		return err
 	}
-	if err := requireBinary("treehouse"); err != nil {
-		return err
-	}
 	gateEnabled := *gate || cfg.Gate.Enabled
 	if gateEnabled {
 		if err := requireCommand(cfg.Gate.Command); err != nil {
@@ -207,13 +226,13 @@ func startRun(args []string) error {
 		}
 	}
 
-	runID := newRunID(*task)
+	runID := newRunID(taskText)
 	runDir := filepath.Join(root, runRoot, runID)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return err
 	}
 
-	worktree, err := leaseWorktree(root, runID)
+	worktree, backend, err := leaseWorktree(root, runID)
 	if err != nil {
 		return err
 	}
@@ -228,6 +247,7 @@ func startRun(args []string) error {
 		PlannerDone:     filepath.Join(runDir, "planner.done"),
 		ImplementDone:   filepath.Join(runDir, "implement.done"),
 		WorktreePath:    worktree,
+		WorktreeBackend: backend,
 		TmuxSession:     "sidekick-" + runID,
 		GateEnabled:     gateEnabled,
 		PlannerName:     plannerAgent.Name,
@@ -237,7 +257,7 @@ func startRun(args []string) error {
 		state.ReviewerNames = append(state.ReviewerNames, reviewer.Name)
 	}
 
-	if err := writeRunFiles(state, *task); err != nil {
+	if err := writeRunFiles(state, taskText); err != nil {
 		return err
 	}
 	if err := writeState(state); err != nil {
@@ -251,11 +271,30 @@ func startRun(args []string) error {
 	fmt.Printf("session: %s\n", state.TmuxSession)
 	fmt.Printf("worktree: %s\n", state.WorktreePath)
 	fmt.Printf("state: %s\n", filepath.Join(runDir, "state.json"))
-	if *attach {
-		return attachTmux(state.TmuxSession)
+	if *noAttach {
+		fmt.Printf("attach: tmux attach -t %s\n", state.TmuxSession)
+		return nil
 	}
-	fmt.Printf("attach: tmux attach -t %s\n", state.TmuxSession)
-	return nil
+	return attachTmux(state.TmuxSession)
+}
+
+// readTask sources the task when --task is absent: an interactive prompt on a
+// TTY, otherwise all of piped stdin.
+func readTask() (string, error) {
+	// ponytail: ModeCharDevice tty check, no x/term dep
+	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		fmt.Fprint(os.Stderr, "Task> ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", err
+		}
+		return strings.TrimSpace(line), nil
+	}
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func showStatus(args []string) error {
@@ -580,20 +619,102 @@ func requireAgent(agent AgentConfig) error {
 	}
 }
 
-func leaseWorktree(root, runID string) (string, error) {
-	cmd := exec.Command("treehouse", "get", "--lease", "--lease-holder", "sidekick:"+runID)
-	cmd.Dir = root
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
+// leaseWorktree gets an isolated worktree, preferring treehouse when it is
+// available and falling back to a plain git worktree otherwise. It returns the
+// worktree path and the backend used ("treehouse" or "git").
+func leaseWorktree(root, runID string) (string, string, error) {
+	if _, err := exec.LookPath("treehouse"); err == nil {
+		cmd := exec.Command("treehouse", "get", "--lease", "--lease-holder", "sidekick:"+runID)
+		cmd.Dir = root
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err == nil {
+			return strings.TrimSpace(string(out)), "treehouse", nil
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("treehouse lease failed: %s", msg)
+		fmt.Fprintf(os.Stderr, "sidekick: treehouse lease failed (%s); using git worktree\n", msg)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return gitWorktree(root, runID)
+}
+
+func gitWorktree(root, runID string) (string, string, error) {
+	// ponytail: branch off current HEAD, worktree lives in the ignored .sidekick tree
+	path := filepath.Join(root, ".sidekick", "worktrees", runID)
+	cmd := exec.Command("git", "-C", root, "worktree", "add", "-b", "sidekick/"+runID, path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", "", fmt.Errorf("git worktree add failed: %s", msg)
+	}
+	return path, "git", nil
+}
+
+// cleanRuns tears down finished runs: removes git-backed worktrees and their
+// branches, kills the run's own tmux session, and deletes the run dir. With
+// --run it targets one run; otherwise every run under .sidekick/runs.
+func cleanRuns(args []string) error {
+	fs := flag.NewFlagSet("clean", flag.ContinueOnError)
+	repo := fs.String("repo", ".", "repository path")
+	only := fs.String("run", "", "clean a single run by ID (default: all runs)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	root, err := repoRoot(*repo)
+	if err != nil {
+		return err
+	}
+
+	runsDir := filepath.Join(root, runRoot)
+	entries, err := os.ReadDir(runsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("no runs to clean")
+			return nil
+		}
+		return err
+	}
+
+	cleaned := 0
+	for _, e := range entries {
+		if !e.IsDir() || (*only != "" && e.Name() != *only) {
+			continue
+		}
+		runDir := filepath.Join(runsDir, e.Name())
+		// ponytail: best-effort teardown; a missing state.json still gets its dir removed
+		if state, err := loadState(runDir); err == nil {
+			if state.WorktreeBackend == "git" && state.WorktreePath != "" {
+				runQuiet("git", "-C", root, "worktree", "remove", "--force", state.WorktreePath)
+				runQuiet("git", "-C", root, "branch", "-D", "sidekick/"+state.ID)
+			}
+			// only touch the session sidekick created for this run
+			if state.TmuxSession != "" {
+				runQuiet("tmux", "kill-session", "-t", state.TmuxSession)
+			}
+		}
+		if err := os.RemoveAll(runDir); err != nil {
+			return err
+		}
+		fmt.Printf("cleaned %s\n", e.Name())
+		cleaned++
+	}
+	runQuiet("git", "-C", root, "worktree", "prune")
+	if cleaned == 0 {
+		fmt.Println("no runs to clean")
+	}
+	return nil
+}
+
+// runQuiet runs a command and ignores its outcome; used for best-effort cleanup.
+func runQuiet(name string, args ...string) {
+	_ = exec.Command(name, args...).Run()
 }
 
 func writeRunFiles(state RunState, task string) error {

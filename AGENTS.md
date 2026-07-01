@@ -7,13 +7,14 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 - Language: Go, single-package CLI in `main.go`.
 - Dev shell: `flake.nix`.
 - Tests: Go unit tests in `main_test.go`.
-- Runtime state: target repositories get `.sidekick/config.json` and `.sidekick/runs/<id>/`.
-- Orchestration: `sidekick run` leases a Treehouse worktree, creates a tmux session, and starts planner, dashboard, implementer, reviewer, and optional gate windows.
+- Runtime state: target repositories get an optional `.sidekick/config.json` and `.sidekick/runs/<id>/`.
+- Entry: bare `sidekick` (no subcommand) runs the orchestration from the current repo, prompting for the task and auto-attaching. `sidekick run` is the same path with explicit flags.
+- Orchestration: leases a Treehouse worktree when available (otherwise a plain git worktree under `.sidekick/worktrees/<id>`), creates a tmux session, and starts planner, dashboard, implementer, reviewer, and optional gate windows.
 
 ## Workflow
 
 - Planner runs in the original repo and writes `plan.md`.
-- Implementer waits for `planner.done`, then works inside the leased Treehouse worktree.
+- Implementer waits for `planner.done`, then works inside the isolated worktree.
 - Reviewers wait for `implement.done`, then review the worktree diff.
 - Optional gate runs the configured `no-mistakes` command after implementation.
 - Dashboard runs `sidekick status --watch` and renders the goal, phase, pipeline state, artifacts, recent logs, and ASCII Sidekick mascot.

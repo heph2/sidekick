@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -155,6 +156,78 @@ func TestRenderStatusIncludesMascotAndArtifacts(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestGitWorktreeFallback(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"commit", "--allow-empty", "-m", "root"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	path, backend, err := gitWorktree(root, "test-run")
+	if err != nil {
+		t.Fatalf("gitWorktree() error = %v", err)
+	}
+	if backend != "git" {
+		t.Fatalf("backend = %q, want git", backend)
+	}
+	want := filepath.Join(root, ".sidekick", "worktrees", "test-run")
+	if path != want {
+		t.Fatalf("path = %q, want %q", path, want)
+	}
+	if fi, err := os.Stat(path); err != nil || !fi.IsDir() {
+		t.Fatalf("worktree dir missing: %v", err)
+	}
+}
+
+func TestCleanRunsRemovesGitWorktree(t *testing.T) {
+	root := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@example.com"},
+		{"config", "user.name", "test"},
+		{"commit", "--allow-empty", "-m", "root"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	path, backend, err := gitWorktree(root, "test-run")
+	if err != nil {
+		t.Fatalf("gitWorktree() error = %v", err)
+	}
+	runDir := filepath.Join(root, runRoot, "test-run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state := RunState{ID: "test-run", RunDir: runDir, WorktreePath: path, WorktreeBackend: backend, TmuxSession: "sidekick-test-run"}
+	if err := writeState(state); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cleanRuns([]string{"--repo", root}); err != nil {
+		t.Fatalf("cleanRuns() error = %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("worktree still present: %v", err)
+	}
+	if _, err := os.Stat(runDir); !os.IsNotExist(err) {
+		t.Fatalf("run dir still present: %v", err)
+	}
+	out, _ := exec.Command("git", "-C", root, "branch", "--list", "sidekick/test-run").Output()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("branch not deleted: %q", out)
 	}
 }
 
