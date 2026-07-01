@@ -347,14 +347,14 @@ func TestBuildStatusViewOmitsLearnWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestRenderStatusIncludesMascotAndArtifacts(t *testing.T) {
+func TestRenderStatusIncludesHeaderAndArtifacts(t *testing.T) {
 	state := testRunState(t, false)
 	var out bytes.Buffer
-	if err := renderStatus(&out, state.RunDir, 80); err != nil {
+	if err := renderStatus(&out, state.RunDir, 80, 0); err != nil {
 		t.Fatalf("renderStatus() error = %v", err)
 	}
 	text := out.String()
-	for _, want := range []string{"Sidekick", "always-on companion", "Ship the dashboard", "worktree:"} {
+	for _, want := range []string{"Sidekick", "Ship the dashboard", "worktree:"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("rendered status missing %q:\n%s", want, text)
 		}
@@ -492,7 +492,7 @@ func TestLandCommit(t *testing.T) {
 }
 
 func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
-	// go test stdout is not a TTY, so col() and the mascot's fg() must emit no
+	// go test stdout is not a TTY, so col() and the spinner's fg() must emit no
 	// escape codes.
 	state := testRunState(t, false)
 	if err := writeState(state); err != nil {
@@ -502,14 +502,14 @@ func TestRenderStatusNoColorWhenNotTTY(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := renderStatus(&buf, state.RunDir, 100); err != nil {
+	if err := renderStatus(&buf, state.RunDir, 100, 0); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(buf.String(), "\033[") {
 		t.Fatalf("dashboard leaked ANSI escapes to non-tty output:\n%s", buf.String())
 	}
 	if !strings.Contains(buf.String(), "Sidekick") {
-		t.Fatalf("dashboard missing plain mascot text:\n%s", buf.String())
+		t.Fatalf("dashboard missing plain wordmark text:\n%s", buf.String())
 	}
 }
 

@@ -148,7 +148,7 @@ Usage:
   sidekick [--repo PATH] [--gate] [--no-learn] [--no-land] [--no-attach]
   sidekick run [--task TEXT] [--repo PATH] [--planner NAME] [--implementer NAME] [--gate] [--no-learn] [--no-land] [--no-attach]
   sidekick console [--repo PATH] [--gate] [--no-learn] [--no-land]
-  sidekick status --run-dir PATH [--watch] [--interval 2s]
+  sidekick status --run-dir PATH [--watch] [--interval 120ms]
   sidekick init [--repo PATH]
   sidekick agent --repo PATH --run-dir PATH --role ROLE --prompt FILE --output FILE [--done FILE]
   sidekick gate --repo PATH --run-dir PATH --output FILE [--done FILE]
@@ -482,7 +482,7 @@ func showStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	runDir := fs.String("run-dir", "", "run directory")
 	watch := fs.Bool("watch", false, "redraw status until interrupted")
-	interval := fs.Duration("interval", 2*time.Second, "watch redraw interval")
+	interval := fs.Duration("interval", 120*time.Millisecond, "watch redraw interval")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -500,11 +500,16 @@ func showStatus(args []string) error {
 			return err
 		}
 		previousPhase := ""
+		frame := 0
+		// ponytail: full redraw at 120ms rereads small run files each frame;
+		// fine at this size, throttle or diff-render if files grow.
 		for {
-			fmt.Print("\033[H\033[2J")
-			if err := renderStatus(os.Stdout, *runDir, terminalWidth()); err != nil {
+			fmt.Print("\033[H")
+			if err := renderStatus(os.Stdout, *runDir, terminalWidth(), frame); err != nil {
 				return err
 			}
+			fmt.Print("\033[J")
+			frame++
 			view, err := buildStatusView(*runDir)
 			if err != nil {
 				return err
@@ -521,7 +526,7 @@ func showStatus(args []string) error {
 			time.Sleep(*interval)
 		}
 	}
-	return renderStatus(os.Stdout, *runDir, terminalWidth())
+	return renderStatus(os.Stdout, *runDir, terminalWidth(), 0)
 }
 
 func runAgent(args []string) error {
@@ -1152,7 +1157,9 @@ type StatusView struct {
 	RecentLines []string
 }
 
-func renderStatus(w io.Writer, runDir string, width int) error {
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+func renderStatus(w io.Writer, runDir string, width int, frame int) error {
 	view, err := buildStatusView(runDir)
 	if err != nil {
 		return err
@@ -1164,10 +1171,9 @@ func renderStatus(w io.Writer, runDir string, width int) error {
 		width = 120
 	}
 
-	fmt.Fprint(w, mascotColored())
-	fmt.Fprintf(w, "\n%s\n", strings.Repeat("=", width))
-	fmt.Fprintf(w, "Sidekick run: %s\n", view.State.ID)
-	fmt.Fprintf(w, "Phase: %s | Elapsed: %s\n", col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
+	fmt.Fprintf(w, "%s %s  %s  %s\n", spinnerGlyph(view.Phase, frame), col("1", "Sidekick"), col(phaseColor(view.Phase), view.Phase), view.Elapsed.Round(time.Second))
+	fmt.Fprintf(w, "%s\n", strings.Repeat("=", width))
+	fmt.Fprintf(w, "Run:  %s\n", view.State.ID)
 	fmt.Fprintf(w, "Goal: %s\n", col("1", clip(view.Goal, width-6)))
 	fmt.Fprintf(w, "%s\n\n", strings.Repeat("=", width))
 
@@ -1342,6 +1348,25 @@ func statusMark(status string) string {
 		return ">"
 	default:
 		return " "
+	}
+}
+
+func spinnerGlyph(phase string, frame int) string {
+	switch {
+	case phase == "complete":
+		return fg(80, 200, 120, "✓")
+	case strings.HasPrefix(phase, "failed"):
+		return fg(255, 95, 95, "✗")
+	default:
+		i := frame % len(spinnerFrames)
+		if i < 0 {
+			i = 0
+		}
+		t := float64(i) / float64(len(spinnerFrames)-1)
+		r := lerp(255, 255, t)
+		g := lerp(140, 105, t)
+		b := lerp(0, 180, t)
+		return fg(r, g, b, spinnerFrames[i])
 	}
 }
 
