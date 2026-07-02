@@ -53,7 +53,7 @@ The default console flow is:
 Build:
 
 ```sh
-go build -o bin/sidekick .
+go build -o bin/sidekick ./cmd/sidekick
 ```
 
 Start a run from inside any git repo. With no arguments, Sidekick prompts for
