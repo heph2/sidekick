@@ -145,6 +145,7 @@ func agentFromHarness(sc *bufio.Scanner, role string, cur config.AgentConfig, ha
 		agent.Name = defaultAgentName(harness, role)
 		agent.Model = ask(sc, role+" model", cur.Model)
 		agent.Prompt = cur.Prompt
+		agent.Fallbacks = cur.Fallbacks
 		if harness == inferHarness(cur) && cur.Name != "" {
 			agent.Interactive = cur.Interactive
 		}
@@ -158,6 +159,7 @@ func agentFromHarness(sc *bufio.Scanner, role string, cur config.AgentConfig, ha
 			Model:       ask(sc, role+" model", cur.Model),
 			Prompt:      cur.Prompt,
 			Interactive: cur.Interactive,
+			Fallbacks:   cur.Fallbacks,
 		}
 		if agent.Name == "" {
 			agent.Name = "custom-" + role

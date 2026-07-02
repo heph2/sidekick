@@ -2,6 +2,7 @@ package agent_test
 
 import (
 	"bytes"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -153,6 +154,115 @@ func TestForRunRoleUsesStateSelection(t *testing.T) {
 	}
 	if a.Name != custom.Name {
 		t.Fatalf("agent = %q, want %q", a.Name, custom.Name)
+	}
+}
+
+func TestForRunRoleChainIncludesConfiguredFallbacks(t *testing.T) {
+	cfg := (config.Config{}).WithDefaults()
+	cfg.Agents.Implementer = config.AgentConfig{
+		Name:       "primary",
+		Command:    []string{"primary"},
+		PromptMode: "stdin",
+		Fallbacks: []config.AgentConfig{
+			{Name: "fallback", Command: []string{"fallback"}, PromptMode: "stdin"},
+		},
+	}
+	state := run.State{ImplementerName: "primary"}
+
+	chain, err := agent.ForRunRoleChain(cfg, state, "implementer")
+	if err != nil {
+		t.Fatalf("ForRunRoleChain() error = %v", err)
+	}
+	var names []string
+	for _, a := range chain {
+		names = append(names, a.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"primary", "fallback"}) {
+		t.Fatalf("chain = %#v", names)
+	}
+}
+
+func TestRunFallsBackAfterLimitFailure(t *testing.T) {
+	state := testutil.RunState(t, false)
+	if err := os.MkdirAll(state.RepoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state.WorktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	promptPath := filepath.Join(state.RunDir, "prompt.md")
+	testutil.MustWrite(t, promptPath, "do the task\n")
+	outputPath := filepath.Join(state.RunDir, "agent.log")
+	donePath := filepath.Join(state.RunDir, "agent.done")
+	cfg := config.Config{
+		Agents: config.AgentsConfig{
+			Implementer: config.AgentConfig{
+				Name:       "primary",
+				Command:    []string{"sh", "-c", "cat >/dev/null; echo 'usage limit reached' >&2; exit 1"},
+				PromptMode: "stdin",
+				Fallbacks: []config.AgentConfig{
+					{Name: "fallback", Command: []string{"sh", "-c", "cat >/dev/null; echo fallback-ran"}, PromptMode: "stdin"},
+				},
+			},
+		},
+	}
+	state.ImplementerName = "primary"
+
+	if err := agent.Run(cfg, state, "implementer", promptPath, outputPath, donePath); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !run.Exists(donePath) {
+		t.Fatal("done marker not written")
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	if !strings.Contains(log, "usage limit reached") || !strings.Contains(log, "falling back to fallback") || !strings.Contains(log, "fallback-ran") {
+		t.Fatalf("fallback log missing expected content:\n%s", log)
+	}
+}
+
+func TestRunDoesNotFallbackAfterNormalFailure(t *testing.T) {
+	state := testutil.RunState(t, false)
+	if err := os.MkdirAll(state.RepoRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state.WorktreePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	promptPath := filepath.Join(state.RunDir, "prompt.md")
+	testutil.MustWrite(t, promptPath, "do the task\n")
+	outputPath := filepath.Join(state.RunDir, "agent.log")
+	donePath := filepath.Join(state.RunDir, "agent.done")
+	cfg := config.Config{
+		Agents: config.AgentsConfig{
+			Implementer: config.AgentConfig{
+				Name:       "primary",
+				Command:    []string{"sh", "-c", "cat >/dev/null; echo 'syntax error' >&2; exit 1"},
+				PromptMode: "stdin",
+				Fallbacks: []config.AgentConfig{
+					{Name: "fallback", Command: []string{"sh", "-c", "cat >/dev/null; echo fallback-ran"}, PromptMode: "stdin"},
+				},
+			},
+		},
+	}
+	state.ImplementerName = "primary"
+
+	if err := agent.Run(cfg, state, "implementer", promptPath, outputPath, donePath); err == nil {
+		t.Fatal("Run() error = nil, want failure")
+	}
+	if !run.Exists(donePath + ".failed") {
+		t.Fatal("failed marker not written")
+	}
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(data)
+	if strings.Contains(log, "fallback-ran") || strings.Contains(log, "falling back") {
+		t.Fatalf("unexpected fallback log:\n%s", log)
 	}
 }
 

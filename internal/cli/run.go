@@ -117,11 +117,21 @@ func validateAgents(cfg config.Config, gateEnabled, learnEnabled bool) error {
 		agents = append(agents, cfg.Agents.Learner)
 	}
 	for _, a := range agents {
-		if err := config.RequireAgent(a); err != nil {
-			return err
+		for _, candidate := range agentWithFallbacks(a) {
+			if err := config.RequireAgent(candidate); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func agentWithFallbacks(a config.AgentConfig) []config.AgentConfig {
+	agents := []config.AgentConfig{a}
+	for _, fallback := range a.Fallbacks {
+		agents = append(agents, agentWithFallbacks(fallback)...)
+	}
+	return agents
 }
 
 // readTask sources the task when --task is absent: an interactive prompt on a

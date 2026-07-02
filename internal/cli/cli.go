@@ -94,7 +94,8 @@ Typical flow:
 No config or treehouse setup is required: sidekick uses built-in defaults and
 falls back to a plain git worktree when treehouse is unavailable.
 Set maxReviewCycles in .sidekick/config.json to cap implement/review loops
-(default: 3).
+(default: 3). Agent entries may include fallbacks, tried only when a harness
+fails with usage, quota, or rate-limit output.
 `
 }
 

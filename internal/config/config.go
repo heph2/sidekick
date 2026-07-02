@@ -52,6 +52,9 @@ type AgentConfig struct {
 	// Interactive runs the harness attached to the pane's TTY (a live chat)
 	// and gates the pipeline on human approval instead of capturing output.
 	Interactive bool `json:"interactive,omitempty"`
+	// Fallbacks are tried, in order, when this harness fails with output that
+	// looks like a usage, quota, or rate-limit failure.
+	Fallbacks []AgentConfig `json:"fallbacks,omitempty"`
 }
 
 type GateConfig struct {
@@ -76,6 +79,9 @@ func Default() Config {
 				Name:       "codex-implementer",
 				Command:    []string{"codex", "exec", "--sandbox", "workspace-write"},
 				PromptMode: "stdin",
+				Fallbacks: []AgentConfig{
+					{Name: "claude-implementer", Command: []string{"claude"}, PromptMode: "stdin"},
+				},
 			},
 			Reviewers: []AgentConfig{
 				{Name: "codex-reviewer", Command: []string{"codex", "exec"}, PromptMode: "stdin"},
@@ -85,6 +91,9 @@ func Default() Config {
 				Name:       "claude-learner",
 				Command:    []string{"claude"},
 				PromptMode: "stdin",
+				Fallbacks: []AgentConfig{
+					{Name: "codex-learner", Command: []string{"codex", "exec"}, PromptMode: "stdin"},
+				},
 			},
 		},
 		Gate: GateConfig{
@@ -134,9 +143,21 @@ func (cfg Config) WithDefaults() Config {
 }
 
 func (cfg Config) AllAgents() []AgentConfig {
-	agents := []AgentConfig{cfg.Agents.Planner, cfg.Agents.Implementer}
-	agents = append(agents, cfg.Agents.Reviewers...)
-	agents = append(agents, cfg.Agents.Learner)
+	var agents []AgentConfig
+	agents = appendAgentAndFallbacks(agents, cfg.Agents.Planner)
+	agents = appendAgentAndFallbacks(agents, cfg.Agents.Implementer)
+	for _, reviewer := range cfg.Agents.Reviewers {
+		agents = appendAgentAndFallbacks(agents, reviewer)
+	}
+	agents = appendAgentAndFallbacks(agents, cfg.Agents.Learner)
+	return agents
+}
+
+func appendAgentAndFallbacks(agents []AgentConfig, agent AgentConfig) []AgentConfig {
+	agents = append(agents, agent)
+	for _, fallback := range agent.Fallbacks {
+		agents = appendAgentAndFallbacks(agents, fallback)
+	}
 	return agents
 }
 

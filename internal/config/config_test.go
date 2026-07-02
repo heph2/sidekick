@@ -32,11 +32,17 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.Agents.Implementer.Name == "" {
 		t.Fatal("implementer default missing")
 	}
+	if len(cfg.Agents.Implementer.Fallbacks) != 1 || cfg.Agents.Implementer.Fallbacks[0].Name != "claude-implementer" {
+		t.Fatalf("implementer fallbacks = %#v", cfg.Agents.Implementer.Fallbacks)
+	}
 	if len(cfg.Agents.Reviewers) != 2 {
 		t.Fatalf("reviewer defaults = %d, want 2", len(cfg.Agents.Reviewers))
 	}
 	if cfg.Agents.Learner.Name == "" {
 		t.Fatal("learner default missing")
+	}
+	if len(cfg.Agents.Learner.Fallbacks) != 1 || cfg.Agents.Learner.Fallbacks[0].Name != "codex-learner" {
+		t.Fatalf("learner fallbacks = %#v", cfg.Agents.Learner.Fallbacks)
 	}
 	if !reflect.DeepEqual(cfg.Gate.Command, []string{"no-mistakes", "-y"}) {
 		t.Fatalf("gate command = %#v", cfg.Gate.Command)

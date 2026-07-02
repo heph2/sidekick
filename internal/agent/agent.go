@@ -94,6 +94,29 @@ func ForRunRole(cfg config.Config, state run.State, role string) (config.AgentCo
 	return config.AgentConfig{}, fmt.Errorf("unknown role %q", role)
 }
 
+// ForRunRoleChain resolves the primary agent for a role plus any configured
+// usage-limit fallbacks for that agent.
+func ForRunRoleChain(cfg config.Config, state run.State, role string) ([]config.AgentConfig, error) {
+	a, err := ForRunRole(cfg, state, role)
+	if err != nil {
+		return nil, err
+	}
+	chain := []config.AgentConfig{a}
+	for _, fallback := range a.Fallbacks {
+		chain = appendFallbackChain(chain, fallback)
+	}
+	return chain, nil
+}
+
+func appendFallbackChain(chain []config.AgentConfig, a config.AgentConfig) []config.AgentConfig {
+	a = config.Normalize(a)
+	chain = append(chain, a)
+	for _, fallback := range a.Fallbacks {
+		chain = appendFallbackChain(chain, fallback)
+	}
+	return chain
+}
+
 // WorkDir picks the directory an agent runs in: the real repo for planner and
 // learner, the isolated worktree for everything else.
 func WorkDir(state run.State, role string) string {
@@ -106,10 +129,11 @@ func WorkDir(state run.State, role string) string {
 // Run executes one agent stage: it resolves the role's agent, feeds it the
 // prompt file, tees output to outputPath, and maintains the done marker.
 func Run(cfg config.Config, state run.State, role, promptPath, outputPath, donePath string) error {
-	a, err := ForRunRole(cfg, state, role)
+	chain, err := ForRunRoleChain(cfg, state, role)
 	if err != nil {
 		return err
 	}
+	a := chain[0]
 
 	prompt, err := os.ReadFile(promptPath)
 	if err != nil {
@@ -130,29 +154,73 @@ func Run(cfg config.Config, state run.State, role, promptPath, outputPath, doneP
 	}
 	defer out.Close()
 
-	cmd, err := Command(a, strings.TrimSpace(string(prompt)), promptPath)
-	if err != nil {
-		return err
-	}
-	cmd.Dir = WorkDir(state, role)
-	cmd.Env = env
-	cmd.Stdin = Stdin(a, prompt)
-	cmd.Stdout = io.MultiWriter(os.Stdout, out)
-	// tee stderr to the log too, else agent failures leave an empty log
-	cmd.Stderr = io.MultiWriter(os.Stderr, out)
-
-	if err := cmd.Run(); err != nil {
-		if donePath != "" {
-			_ = run.Mark(donePath + ".failed")
+	var lastErr error
+	for i, candidate := range chain {
+		runErr, limitErr := runHeadlessAgent(candidate, prompt, promptPath, WorkDir(state, role), env, out)
+		if runErr == nil {
+			if donePath != "" {
+				if err := run.Mark(donePath); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
-		return err
+		lastErr = runErr
+		if !limitErr || i == len(chain)-1 {
+			break
+		}
+		fmt.Fprintf(io.MultiWriter(os.Stderr, out), "\nsidekick: %s hit a usage limit; falling back to %s\n\n", candidate.Name, chain[i+1].Name)
 	}
 	if donePath != "" {
-		if err := run.Mark(donePath); err != nil {
-			return err
+		_ = run.Mark(donePath + ".failed")
+	}
+	return lastErr
+}
+
+func runHeadlessAgent(a config.AgentConfig, prompt []byte, promptPath, dir string, env []string, log io.Writer) (error, bool) {
+	cmd, err := Command(a, strings.TrimSpace(string(prompt)), promptPath)
+	if err != nil {
+		return err, false
+	}
+	cmd.Dir = dir
+	cmd.Env = env
+	cmd.Stdin = Stdin(a, prompt)
+	var attempt bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, log, &attempt)
+	// tee stderr to the log too, else agent failures leave an empty log
+	cmd.Stderr = io.MultiWriter(os.Stderr, log, &attempt)
+	err = cmd.Run()
+	return err, err != nil && LooksLikeLimitFailure(attempt.String())
+}
+
+// LooksLikeLimitFailure reports whether failed harness output looks like a
+// usage, rate, or quota limit. It is intentionally evaluated only after a
+// process failure, so broad "limit" phrases are less likely to hide real bugs.
+func LooksLikeLimitFailure(output string) bool {
+	s := strings.ToLower(output)
+	patterns := []string{
+		"rate limit",
+		"rate_limit",
+		"ratelimit",
+		"usage limit",
+		"usage cap",
+		"quota",
+		"limit reached",
+		"limit has been reached",
+		"too many requests",
+		"429",
+		"resource_exhausted",
+		"resource exhausted",
+		"credit balance",
+		"insufficient credits",
+		"billing hard limit",
+	}
+	for _, pattern := range patterns {
+		if strings.Contains(s, pattern) {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 // runInteractive attaches the harness to the pane's TTY (a live chat, no
