@@ -4,9 +4,16 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 
 ## Current Architecture
 
-- Language: Go, single-package CLI in `main.go`.
+- Language: Go. Entry point in `cmd/sidekick/main.go`; logic lives under `internal/`:
+  - `internal/cli` - subcommand dispatch, console loop, run spawning, cycle/land/clean orchestration.
+  - `internal/config` - `.sidekick/config.json` types, defaults, load, validation.
+  - `internal/run` - run state (`state.json`), run-dir paths and done markers, run discovery.
+  - `internal/agent` - agent command building, prompts, role resolution, verdict parsing, execution.
+  - `internal/ui` - colors, mascot, status views and dashboard rendering.
+  - `internal/tmux`, `internal/worktree`, `internal/sh` - tmux wrappers, worktree lease/fallback, shell quoting.
+  - `internal/testutil` - shared test fixtures.
 - Dev shell: `flake.nix`.
-- Tests: Go unit tests in `main_test.go`.
+- Tests: Go unit tests live next to each package (`internal/*/..._test.go`), with shared fixtures in `internal/testutil`.
 - Runtime state: target repositories get an optional `.sidekick/config.json`, `.sidekick/runs/<id>/`, and persistent `.sidekick/memory.md`.
 - Entry: bare `sidekick` (no subcommand) opens a persistent console session (`sidekick console` running in a `console` window) that keeps prompting for tasks; `sidekick run` stays the scriptable one-shot with explicit flags (`--task`, `--no-attach`, etc.).
 - Orchestration: leases a Treehouse worktree when available (otherwise a plain git worktree under `.sidekick/worktrees/<id>`), creates or reuses a tmux session, and starts a fixed console workspace: `console` plus one aggregate `dashboard`. Inside the console, each run gets a transient planner window (`t1-planner`, `t2-planner`, ...); the cycle (implement -> review -> fix loop), learner, optional gate, and land stages run headlessly in the background and log under the run dir. `sidekick run` remains the windowed one-shot path.
@@ -31,8 +38,8 @@ Sidekick is a local orchestration CLI for agentic development workflows. It coor
 - `notify` config uses terminal bell by default and may run a user-supplied `notify.command`; desktop notification commands are not auto-detected.
 - `maxReviewCycles` defaults to 3 and caps the implement/review loop.
 - Do not commit generated binaries such as `bin/sidekick`.
-- Preserve ASCII-only source files unless a change explicitly requires otherwise. The mascot is a sanctioned exception: it uses 24-bit truecolor escapes (`fg`/`mascotColored` in `main.go`) to render a warm orange-to-pink gradient, gated off exactly like `col()` (no-op under `NO_COLOR` or a non-TTY), so plain-text and piped output stay clean.
-- Run `gofmt -w` on Go files, then `go test ./...` and `go build -o bin/sidekick .`.
+- Preserve ASCII-only source files unless a change explicitly requires otherwise. The mascot is a sanctioned exception: it uses 24-bit truecolor escapes (`fg`/`MascotColored` in `internal/ui`) to render a warm orange-to-pink gradient, gated off exactly like `col()` (no-op under `NO_COLOR` or a non-TTY), so plain-text and piped output stay clean.
+- Run `gofmt -w` on Go files, then `go test ./...` and `go build -o bin/sidekick ./cmd/sidekick`.
 
 ## Product Direction
 
